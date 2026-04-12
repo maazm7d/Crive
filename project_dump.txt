@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 19:34:20 UTC 2026
+Generated: Sun Apr 12 19:35:54 UTC 2026
 ==============================
 
 FILE TREE:
@@ -278,7 +278,6 @@ jobs:
           echo "===== RUN CRIVE ====="
           ./build/bin/crive test.zip \
             --wordlist wordlist.txt \
-            --threads 1 \
             --verbose \
             > zip.log 2>&1 || true
 
@@ -303,7 +302,6 @@ jobs:
           echo "===== RUN CRIVE ====="
           ./build/bin/crive test.7z \
             --wordlist wordlist.txt \
-            --threads 1 \
             --verbose \
             > 7z.log 2>&1 || true
 
@@ -316,7 +314,7 @@ jobs:
       - name: Benchmark (Verbose)
         run: |
           set -x
-          ./build/bin/crive --benchmark 5 --threads 1 > bench.log 2>&1 || true
+          ./build/bin/crive --benchmark 5 > bench.log 2>&1 || true
           cat bench.log
 
   valgrind:
@@ -370,7 +368,7 @@ jobs:
 
       - name: Run benchmark
         run: |
-          ./build/bin/crive --benchmark 10 --threads 1 > benchmark.log 2>&1 || true
+          ./build/bin/crive --benchmark 10 > benchmark.log 2>&1 || true
           cat benchmark.log
 
       - name: Extract speed
@@ -12600,5 +12598,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 19:34:20 UTC 2026
+Dump Completed: Sun Apr 12 19:35:54 UTC 2026
 ----------------------------------------
