@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 13:01:02 UTC 2026
+Generated: Sun Apr 12 13:02:33 UTC 2026
 ==============================
 
 FILE TREE:
@@ -228,11 +228,7 @@ jobs:
           #   -v for compiler internal steps
           #   -Wl,--verbose for linker detailed output
           #   Also disable @ suppression by overriding Q (if any) – not needed.
-          make termux \
-            CC=gcc \
-            CFLAGS="-v -Wl,--verbose -D_GNU_SOURCE" \
-            LDFLAGS="-v" \
-            BUILD_PROFILE=release
+          make termux
         continue-on-error: false
 
       - name: Archive build logs (if any)
@@ -12451,5 +12447,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 13:01:02 UTC 2026
+Dump Completed: Sun Apr 12 13:02:33 UTC 2026
 ----------------------------------------
