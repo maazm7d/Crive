@@ -22,6 +22,8 @@
 #include <pthread.h>
 #include <math.h>
 
+#include "archive.h"   /* Provides archive_ctx_t and common declarations */
+
 /* Forward declarations from utils.c */
 typedef enum {
     LOG_DEBUG   = 0,
@@ -43,24 +45,8 @@ void log_message(log_level_t level, const char *fmt, ...);
 #define PACKED                __attribute__((packed))
 
 #define MAX_PASSWORD_LEN      128
-#define MAX_PATH_LEN          4096
 #define KB                    (1024ULL)
 #define MB                    (1024ULL * KB)
-
-/* ============================================================
- * ARCHIVE TYPE ENUM
- * ============================================================ */
-
-typedef enum {
-    ARCHIVE_UNKNOWN = 0,
-    ARCHIVE_ZIP     = 1,
-    ARCHIVE_7Z      = 2,
-    ARCHIVE_MAX
-} archive_type_t;
-
-/* ============================================================
- * FORWARD DECLARATIONS
- * ============================================================ */
 
 /* CRC32 from utils.c */
 extern uint32_t g_crc32_table[256];
@@ -831,7 +817,7 @@ typedef struct PACKED {
 
 #define ZIP_MAX_FILES   65536
 
-typedef struct {
+struct zip_ctx {
     /* File data */
     const uint8_t   *data;
     size_t           data_size;
@@ -866,7 +852,7 @@ typedef struct {
     int              num_files;
     char             filename[256];
     bool             has_encrypted_file;
-} zip_ctx_t;
+};
 
 /* ============================================================
  * 7Z ARCHIVE STRUCTURES
@@ -921,7 +907,7 @@ typedef struct PACKED {
     uint32_t next_header_crc;
 } sz_signature_header_t;
 
-typedef struct {
+struct sz_ctx {
     /* Raw header data */
     const uint8_t   *data;
     size_t           data_size;
@@ -947,26 +933,7 @@ typedef struct {
     uint32_t         next_header_crc;
     uint64_t         next_header_offset;
     uint64_t         next_header_size;
-
-} sz_ctx_t;
-
-/* ============================================================
- * UNIFIED ARCHIVE CONTEXT
- * ============================================================ */
-
-typedef struct {
-    archive_type_t   type;
-    char             path[MAX_PATH_LEN];
-
-    union {
-        zip_ctx_t    zip;
-        sz_ctx_t     sz;
-    };
-
-    /* Thread-local scratch buffers - each thread gets its own archive_ctx */
-    uint8_t          scratch[4096];
-
-} archive_ctx_t;
+};
 
 /* ============================================================
  * PKZIP ENCRYPTION KEYS
@@ -977,7 +944,7 @@ typedef struct {
 } zip_keys_t;
 
 /* CRC32 table from utils.c */
-uint32_t g_crc32_table[256];
+extern uint32_t g_crc32_table[256];
 
 FORCE_INLINE void zip_update_keys(zip_keys_t *keys, uint8_t c) {
     keys->k0 = crc32_update(keys->k0, &c, 1);
@@ -1056,7 +1023,7 @@ static const uint8_t *zip_find_eocd(const uint8_t *data, size_t size) {
  * Returns true if AES extra was found and parsed.
  */
 static bool zip_parse_aes_extra(const uint8_t *extra, uint16_t extra_len,
-                                 zip_ctx_t *ctx) {
+                                 struct zip_ctx *ctx) {
     const uint8_t *p   = extra;
     const uint8_t *end = extra + extra_len;
 
@@ -1089,7 +1056,7 @@ static bool zip_parse_aes_extra(const uint8_t *extra, uint16_t extra_len,
  * Full ZIP parsing - finds first encrypted entry and extracts
  * encryption header and parameters needed for validation.
  */
-int zip_parse(zip_ctx_t *ctx, const char *path) {
+int zip_parse(struct zip_ctx *ctx, const char *path) {
     memset(ctx, 0, sizeof(*ctx));
 
     ctx->fd = open(path, O_RDONLY);
@@ -1300,7 +1267,7 @@ fail:
     return -1;
 }
 
-void zip_ctx_free(zip_ctx_t *ctx) {
+void zip_ctx_free(struct zip_ctx *ctx) {
     if (!ctx) return;
     if (ctx->data) {
         if (ctx->mmap_used) {
@@ -1408,7 +1375,7 @@ static void pbkdf2_sha1(const uint8_t *password, size_t pass_len,
  *
  * Returns true if password is correct.
  */
-static bool zip_validate_pkzip(const zip_ctx_t *ctx, const char *password) {
+static bool zip_validate_pkzip(const struct zip_ctx *ctx, const char *password) {
     if (UNLIKELY(!ctx->parsed)) return false;
 
     zip_keys_t keys;
@@ -1449,7 +1416,7 @@ static bool zip_validate_pkzip(const zip_ctx_t *ctx, const char *password) {
  *
  * Returns true if password is correct.
  */
-static bool zip_validate_aes(const zip_ctx_t *ctx, const char *password) {
+static bool zip_validate_aes(const struct zip_ctx *ctx, const char *password) {
     if (UNLIKELY(!ctx->parsed || !ctx->is_aes)) return false;
 
     int aes_key_len;
@@ -1478,7 +1445,7 @@ static bool zip_validate_aes(const zip_ctx_t *ctx, const char *password) {
  * Main ZIP validation entry point.
  * Automatically selects PKZIP or WinZip AES validation.
  */
-bool zip_validate_password(const zip_ctx_t *ctx, const char *password) {
+bool zip_validate_password(const struct zip_ctx *ctx, const char *password) {
     if (UNLIKELY(!ctx || !ctx->parsed)) return false;
 
     if (ctx->is_aes) {
@@ -1650,7 +1617,7 @@ static int sz_read_number(sz_reader_t *r, uint64_t *out) {
  *   next ivSize  bytes: iv (padded to 16 if < 16)
  */
 static bool sz_parse_aes_props(const uint8_t *props, size_t props_len,
-                                sz_ctx_t *ctx) {
+                                struct sz_ctx *ctx) {
     if (props_len < 2) return false;
 
     uint8_t b0 = props[0];
@@ -1692,7 +1659,7 @@ static bool sz_parse_aes_props(const uint8_t *props, size_t props_len,
  * (0x06, 0xF1, 0x07, 0x01) in the decoded (or encoded) header.
  */
 static bool sz_scan_for_aes_coder(const uint8_t *data, size_t size,
-                                   sz_ctx_t *ctx) {
+                                   struct sz_ctx *ctx) {
     /*
      * AES-256-SHA-256 codec ID: 06 F1 07 01
      * We scan for this sequence and then read the following property bytes.
@@ -1741,7 +1708,7 @@ static bool sz_scan_for_aes_coder(const uint8_t *data, size_t size,
  *   2. Decrypt first block of encrypted header
  *   3. Verify CRC of decrypted header
  */
-int sz_parse(sz_ctx_t *ctx, const char *path) {
+int sz_parse(struct sz_ctx *ctx, const char *path) {
     memset(ctx, 0, sizeof(*ctx));
 
     ctx->fd = open(path, O_RDONLY);
@@ -1912,7 +1879,7 @@ fail:
     return -1;
 }
 
-void sz_ctx_free(sz_ctx_t *ctx) {
+void sz_ctx_free(struct sz_ctx *ctx) {
     if (!ctx) return;
     if (ctx->data) {
         if (ctx->mmap_used) {
@@ -2050,7 +2017,7 @@ static void sz_derive_key(const char *password,
  *   - We use a heuristic: check if decrypted data looks like
  *     a valid 7z property block (starts with known property IDs)
  */
-bool sz_validate_password(const sz_ctx_t *ctx, const char *password) {
+bool sz_validate_password(const struct sz_ctx *ctx, const char *password) {
     if (UNLIKELY(!ctx || !ctx->parsed)) return false;
     if (UNLIKELY(!ctx->has_encrypted_streams)) return false;
 
@@ -2274,7 +2241,7 @@ void archive_print_info(const archive_ctx_t *ctx, bool no_color) {
 
     switch (ctx->type) {
         case ARCHIVE_ZIP: {
-            const zip_ctx_t *z = &ctx->zip;
+            const struct zip_ctx *z = &ctx->zip;
             fprintf(stderr, "  %sType:%s     %sZIP%s\n",
                     c_l, c_r, c_v, c_r);
             fprintf(stderr, "  %sFiles:%s    %s%d%s\n",
@@ -2303,7 +2270,7 @@ void archive_print_info(const archive_ctx_t *ctx, bool no_color) {
         }
 
         case ARCHIVE_7Z: {
-            const sz_ctx_t *s = &ctx->sz;
+            const struct sz_ctx *s = &ctx->sz;
             fprintf(stderr, "  %sType:%s     %s7-Zip%s\n",
                     c_l, c_r, c_v, c_r);
             fprintf(stderr, "  %sEncrypted:%s%s%s%s\n",
@@ -2348,8 +2315,8 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
      * Create a dummy context with known parameters for benchmarking.
      * We don't need a real file - just exercise the validation code.
      */
-    zip_ctx_t zip_dummy;
-    sz_ctx_t  sz_dummy;
+    struct zip_ctx zip_dummy;
+    struct sz_ctx  sz_dummy;
     memset(&zip_dummy, 0, sizeof(zip_dummy));
     memset(&sz_dummy,  0, sizeof(sz_dummy));
 
