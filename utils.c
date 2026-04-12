@@ -27,6 +27,7 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <locale.h>
+#include <stddef.h> 
 
 /* ============================================================
  * VERSION AND BUILD INFO
