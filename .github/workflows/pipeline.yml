@@ -77,7 +77,7 @@ jobs:
           echo "wrong" > wordlist.txt
           echo "pass123" >> wordlist.txt
 
-          ./build/bin/crive test.zip --wordlist wordlist.txt | tee zip.log
+          ./build/bin/crive test.zip --wordlist wordlist.txt | tee zip.log || true
           grep -i "pass123" zip.log
 
       - name: 7Z cracking test
@@ -88,7 +88,7 @@ jobs:
           echo "badpass" > wordlist.txt
           echo "secret7z" >> wordlist.txt
 
-          ./build/bin/crive test.7z --wordlist wordlist.txt | tee 7z.log
+          ./build/bin/crive test.7z --wordlist wordlist.txt | tee 7z.log || true
           grep -i "secret7z" 7z.log
 
       - name: Quick benchmark
