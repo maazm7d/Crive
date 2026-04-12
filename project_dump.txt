@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 14:33:37 UTC 2026
+Generated: Sun Apr 12 14:52:39 UTC 2026
 ==============================
 
 FILE TREE:
@@ -261,8 +261,8 @@ FILE: ./archive.h
 #include <stddef.h>
 
 #define MAX_PATH_LEN 4096
+#define MAX_PASSWORD_LEN 128
 
-/* Archive type enumeration */
 typedef enum {
     ARCHIVE_UNKNOWN = 0,
     ARCHIVE_ZIP     = 1,
@@ -270,14 +270,62 @@ typedef enum {
     ARCHIVE_MAX
 } archive_type_t;
 
-/* Opaque forward declarations of internal structures */
-typedef struct zip_ctx zip_ctx_t;
-typedef struct sz_ctx  sz_ctx_t;
+/* ZIP context structure – full definition */
+typedef struct zip_ctx {
+    const uint8_t   *data;
+    size_t           data_size;
+    bool             mmap_used;
+    int              fd;
 
-/*
- * Unified archive context – complete definition.
- * This must be visible to engine.c, main.c, and archive.c.
- */
+    uint32_t         crc32;
+    uint16_t         flags;
+    uint16_t         method;
+    uint32_t         compressed_size;
+    uint32_t         uncompressed_size;
+
+    uint8_t          enc_header[12];          /* PKZIP encryption header */
+    uint8_t          check_byte_crc;
+    uint8_t          check_byte_time;
+    bool             use_crc_check;
+
+    bool             is_aes;
+    uint8_t          aes_strength;
+    uint8_t          aes_salt[16];
+    int              aes_salt_len;
+    uint8_t          aes_pwv[2];
+    uint16_t         aes_actual_method;
+
+    bool             parsed;
+    int              num_files;
+    char             filename[256];
+    bool             has_encrypted_file;
+} zip_ctx_t;
+
+/* 7Z context structure – full definition */
+typedef struct sz_ctx {
+    const uint8_t   *data;
+    size_t           data_size;
+    bool             mmap_used;
+    int              fd;
+
+    bool             parsed;
+    bool             has_encrypted_streams;
+    bool             is_header_encrypted;
+
+    uint8_t          aes_iv[16];
+    uint8_t          aes_salt[64];
+    uint32_t         num_cycles_power;
+    int              aes_salt_len;
+
+    uint8_t          enc_header_data[32];
+    size_t           enc_header_size;
+
+    uint32_t         next_header_crc;
+    uint64_t         next_header_offset;
+    uint64_t         next_header_size;
+} sz_ctx_t;
+
+/* Unified archive context */
 struct archive_ctx {
     archive_type_t   type;
     char             path[MAX_PATH_LEN];
@@ -285,12 +333,12 @@ struct archive_ctx {
         zip_ctx_t    zip;
         sz_ctx_t     sz;
     };
-    uint8_t          scratch[4096];   /* thread‑local scratch buffer */
+    uint8_t          scratch[4096];
 };
 
 typedef struct archive_ctx archive_ctx_t;
 
-/* Function prototypes – all implemented in archive.c */
+/* Function prototypes (implemented in archive.c) */
 int  archive_open(archive_ctx_t *ctx, const char *path, archive_type_t type);
 void archive_ctx_free(archive_ctx_t *ctx);
 bool archive_validate_password(const archive_ctx_t *ctx, const char *password);
@@ -12455,5 +12503,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 14:33:37 UTC 2026
+Dump Completed: Sun Apr 12 14:52:39 UTC 2026
 ----------------------------------------
