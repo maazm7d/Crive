@@ -762,6 +762,7 @@ static void *resume_thread_fn(void *arg) {
  * - Updates atomic counters
  * - Stops when found or exhausted
  */
+
 static void *worker_thread_fn(void *arg) {
     worker_args_t   *wa    = (worker_args_t *)arg;
     engine_state_t  *eng   = wa->engine;
@@ -774,7 +775,6 @@ static void *worker_thread_fn(void *arg) {
     ts->running  = true;
     ts->attempts = 0;
 
-    /* Stack-allocated batch to avoid heap allocation in hot loop */
     candidate_batch_t batch;
     batch.count    = 0;
     batch.capacity = (int)(cfg->batch_size > BATCH_MAX_SIZE
@@ -797,7 +797,6 @@ static void *worker_thread_fn(void *arg) {
         /* Get next batch of candidates */
         int n = attack_ctx_next_batch(atk, &batch);
         if (n <= 0) {
-            /* Exhausted or error */
             log_debug("Worker %d: attack exhausted", tid);
             break;
         }
@@ -811,7 +810,7 @@ static void *worker_thread_fn(void *arg) {
 
             const char *pw = batch.passwords[i];
 
-            /* Update thread status (infrequently to reduce cache pressure) */
+            /* Update thread status (infrequently) */
             if (UNLIKELY((ts->attempts & 0xFFULL) == 0)) {
                 size_t pw_len = strlen(pw);
                 if (pw_len >= MAX_PASSWORD_LEN) pw_len = MAX_PASSWORD_LEN - 1;
@@ -829,34 +828,36 @@ static void *worker_thread_fn(void *arg) {
                 log_debug("Worker %d: found password '%s'", tid, pw);
                 goto done;
             }
+        } /* end for */
+
+        /* Flush local_count periodically */
+        if (local_count >= ATTEMPT_FLUSH_THRESHOLD) {
+            atomic_fetch_add_explicit(&eng->total_attempts,
+                                      (uint_fast64_t)local_count,
+                                      memory_order_relaxed);
+            local_count = 0;
         }
-/* Batch done - update global counter atomically (buffered) */
-if (local_count > 0) {
-    if (local_count >= ATTEMPT_FLUSH_THRESHOLD || n < batch.capacity) {
+
+        /* Check global limit */
+        if (cfg->limit > 0) {
+            uint64_t total = atomic_load_explicit(&eng->total_attempts,
+                                                  memory_order_relaxed);
+            if (total >= cfg->limit) {
+                break;
+            }
+        }
+    } /* end while */
+
+done:
+    /* Flush any remaining local_count */
+    if (local_count > 0) {
         atomic_fetch_add_explicit(&eng->total_attempts,
                                   (uint_fast64_t)local_count,
                                   memory_order_relaxed);
-        local_count = 0;
     }
+    ts->running = false;
+    return NULL;
 }
-
-/* Ensure accurate accounting before limit check */
-if (cfg->limit > 0 && local_count > 0) {
-    atomic_fetch_add_explicit(&eng->total_attempts,
-                              (uint_fast64_t)local_count,
-                              memory_order_relaxed);
-    local_count = 0;
-}
-
-/* Check global limit */
-if (cfg->limit > 0) {
-    uint64_t total = atomic_load_explicit(&eng->total_attempts,
-                                          memory_order_relaxed);
-    if (total >= cfg->limit) {
-        break;
-    }
-}
-
 
 /* ============================================================
  * BENCHMARK WORKER
