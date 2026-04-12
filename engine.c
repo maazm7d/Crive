@@ -187,23 +187,6 @@ typedef struct {
 
 typedef struct attack_ctx attack_ctx_t;
 
-struct attack_ctx {
-    attack_mode_t   mode;
-    int             thread_id;
-    int             num_threads;
-    uint64_t        total_generated;
-    bool            initialized;
-    union {
-        /* Dict state fields - enough space for all states */
-        uint8_t     _dict_state[sizeof(void*) * 256];
-        uint8_t     _brute_state[sizeof(void*) * 256];
-        uint8_t     _mask_state[sizeof(void*) * 256];
-        uint8_t     _rule_state[sizeof(void*) * 256];
-        uint8_t     _hybrid_state[sizeof(void*) * 256];
-    };
-    const void *config_ref;
-};
-
 /* Declared in attacks.c */
 extern int  attack_ctx_init_dict   (attack_ctx_t *ctx,
                                      const char *wordlist_path,
@@ -239,6 +222,7 @@ extern void attack_ctx_get_state   (const attack_ctx_t *ctx,
 extern uint64_t attack_ctx_keyspace(const attack_ctx_t *ctx);
 extern uint64_t attack_ctx_get_dict_offset  (const attack_ctx_t *ctx);
 extern uint64_t attack_ctx_get_brute_index  (const attack_ctx_t *ctx);
+extern size_t attack_ctx_size               (void);
 
 #include "archive.h"
 
@@ -516,25 +500,39 @@ static void archive_pool_free(archive_pool_t *pool) {
  * ============================================================ */
 
 typedef struct {
-    attack_ctx_t   *contexts;
+    uint8_t        *storage;
+    size_t          ctx_size;
     int             count;
     bool            initialized;
 } attack_pool_t;
+
+static attack_ctx_t *attack_pool_ctx(attack_pool_t *pool, int idx) {
+    return (attack_ctx_t *)(void *)(pool->storage + ((size_t)idx * pool->ctx_size));
+}
+
+static const attack_ctx_t *attack_pool_ctx_const(const attack_pool_t *pool, int idx) {
+    return (const attack_ctx_t *)(const void *)(pool->storage + ((size_t)idx * pool->ctx_size));
+}
 
 static int attack_pool_init(attack_pool_t *pool,
                               const config_t *cfg,
                               int num_threads,
                               const resume_state_t *resume_st) {
     pool->count    = num_threads;
-    pool->contexts = (attack_ctx_t *)calloc((size_t)num_threads,
-                                             sizeof(attack_ctx_t));
-    if (!pool->contexts) {
+    pool->ctx_size = attack_ctx_size();
+    if (pool->ctx_size == 0) {
+        log_error("attack_pool_init: invalid attack context size");
+        return -1;
+    }
+
+    pool->storage = (uint8_t *)calloc((size_t)num_threads, pool->ctx_size);
+    if (!pool->storage) {
         log_error("attack_pool_init: calloc failed");
         return -1;
     }
 
     for (int i = 0; i < num_threads; i++) {
-        attack_ctx_t *ctx = &pool->contexts[i];
+        attack_ctx_t *ctx = attack_pool_ctx(pool, i);
         int rc = 0;
 
         uint64_t dict_offset = 0;
@@ -623,10 +621,11 @@ static int attack_pool_init(attack_pool_t *pool,
             log_error("attack_pool_init: init failed for thread %d", i);
             /* Cleanup already-initialized ones */
             for (int j = 0; j < i; j++) {
-                attack_ctx_cleanup(&pool->contexts[j]);
+                attack_ctx_cleanup(attack_pool_ctx(pool, j));
             }
-            free(pool->contexts);
-            pool->contexts = NULL;
+            free(pool->storage);
+            pool->storage = NULL;
+            pool->ctx_size = 0;
             return -1;
         }
     }
@@ -638,10 +637,11 @@ static int attack_pool_init(attack_pool_t *pool,
 static void attack_pool_free(attack_pool_t *pool) {
     if (!pool || !pool->initialized) return;
     for (int i = 0; i < pool->count; i++) {
-        attack_ctx_cleanup(&pool->contexts[i]);
+        attack_ctx_cleanup(attack_pool_ctx(pool, i));
     }
-    free(pool->contexts);
-    pool->contexts    = NULL;
+    free(pool->storage);
+    pool->storage     = NULL;
+    pool->ctx_size    = 0;
     pool->count       = 0;
     pool->initialized = false;
 }
@@ -708,8 +708,16 @@ static void *resume_thread_fn(void *arg) {
     while (ra->running &&
            !engine_is_found(eng) &&
            !engine_is_shutdown(eng)) {
-
-        sleep_ms(RESUME_SAVE_INTERVAL_SEC * 1000L);
+        /* Sleep in short slices so shutdown/found can stop promptly. */
+        int wait_ms = RESUME_SAVE_INTERVAL_SEC * 1000;
+        while (wait_ms > 0 &&
+               ra->running &&
+               !engine_is_found(eng) &&
+               !engine_is_shutdown(eng)) {
+            int step = (wait_ms > 200) ? 200 : wait_ms;
+            sleep_ms(step);
+            wait_ms -= step;
+        }
 
         if (!ra->running || engine_is_found(eng)) break;
 
@@ -729,7 +737,7 @@ static void *resume_thread_fn(void *arg) {
 
         /* Get state from thread 0 */
         if (ra->attack_pool && ra->attack_pool->count > 0) {
-            attack_ctx_t *ctx0 = &ra->attack_pool->contexts[0];
+            attack_ctx_t *ctx0 = attack_pool_ctx(ra->attack_pool, 0);
             rs.wordlist_offset  = attack_ctx_get_dict_offset(ctx0);
             rs.bruteforce_index = attack_ctx_get_brute_index(ctx0);
         }
@@ -774,6 +782,8 @@ static void *worker_thread_fn(void *arg) {
 
     log_debug("Worker %d: started", tid);
 
+    uint64_t local_count = 0;
+
     while (LIKELY(!engine_is_found(eng) &&
                   !engine_is_shutdown(eng))) {
 
@@ -787,9 +797,7 @@ static void *worker_thread_fn(void *arg) {
         int n = attack_ctx_next_batch(atk, &batch);
         if (n <= 0) {
             /* Exhausted or error */
-            log_debug("Worker %d: attack exhausted (generated=%llu)",
-                      tid,
-                      (unsigned long long)atk->total_generated);
+            log_debug("Worker %d: attack exhausted", tid);
             break;
         }
 
@@ -808,6 +816,9 @@ static void *worker_thread_fn(void *arg) {
                 ts->current_password[pw_len] = '\0';
             }
 
+            ts->attempts++;
+            local_count++;
+
             /* THE CORE CHECK */
             if (UNLIKELY(archive_validate_password(arch, pw))) {
                 engine_set_found(eng, pw);
@@ -815,14 +826,15 @@ static void *worker_thread_fn(void *arg) {
                 log_debug("Worker %d: found password '%s'", tid, pw);
                 goto done;
             }
-
-            ts->attempts++;
         }
 
         /* Batch done - update global counter atomically */
-        atomic_fetch_add_explicit(&eng->total_attempts,
-                                   (uint_fast64_t)n,
-                                   memory_order_relaxed);
+        if (local_count > 0) {
+            atomic_fetch_add_explicit(&eng->total_attempts,
+                                       (uint_fast64_t)local_count,
+                                       memory_order_relaxed);
+            local_count = 0;
+        }
 
         /* Check global limit */
         if (cfg->limit > 0) {
@@ -836,6 +848,11 @@ static void *worker_thread_fn(void *arg) {
     }
 
 done:
+    if (local_count > 0) {
+        atomic_fetch_add_explicit(&eng->total_attempts,
+                                   (uint_fast64_t)local_count,
+                                   memory_order_relaxed);
+    }
     ts->running = false;
     log_debug("Worker %d: done (attempts=%llu)", tid,
               (unsigned long long)ts->attempts);
@@ -913,7 +930,9 @@ static void *bench_worker_fn(void *arg) {
                 : 0.0;
 
     /* Prevent compiler from eliminating the loop */
-    if (result == 0xDEADBEEFU) fprintf(stderr, "");
+    if (result == 0xDEADBEEFU) {
+        fputc('\n', stderr);
+    }
 
     return NULL;
 }
@@ -937,7 +956,11 @@ typedef enum {
 
 attack_result_t engine_run(const config_t *cfg,
                             archive_ctx_t *master_archive,
-                            const resume_state_t *resume_st) {
+                            const resume_state_t *resume_st,
+                            uint64_t *out_total_tested,
+                            char *out_password,
+                            size_t out_password_len,
+                            double *out_elapsed_sec) {
     log_info("Engine starting: mode=%d threads=%d",
              cfg->attack_mode, cfg->num_threads);
 
@@ -970,7 +993,7 @@ attack_result_t engine_run(const config_t *cfg,
 
     /* Get keyspace estimate */
     if (atk_pool.count > 0) {
-        uint64_t ks = attack_ctx_keyspace(&atk_pool.contexts[0]);
+        uint64_t ks = attack_ctx_keyspace(attack_pool_ctx(&atk_pool, 0));
         eng.keyspace_total = ks;
         if (ks > 0) {
             char ks_str[32];
@@ -1032,7 +1055,7 @@ attack_result_t engine_run(const config_t *cfg,
         workers[i].engine    = &eng;
         workers[i].config    = cfg;
         workers[i].archive   = &arch_pool.contexts[i];
-        workers[i].attack    = &atk_pool.contexts[i];
+        workers[i].attack    = attack_pool_ctx(&atk_pool, i);
         workers[i].started   = false;
 
         int rc = pthread_create(&workers[i].tid, NULL,
@@ -1087,7 +1110,7 @@ attack_result_t engine_run(const config_t *cfg,
         /* Check if all attack contexts exhausted */
         bool all_exhausted = true;
         for (int i = 0; i < atk_pool.count; i++) {
-            if (!attack_ctx_exhausted(&atk_pool.contexts[i])) {
+            if (!attack_ctx_exhausted(attack_pool_ctx_const(&atk_pool, i))) {
                 all_exhausted = false;
                 break;
             }
@@ -1112,6 +1135,20 @@ attack_result_t engine_run(const config_t *cfg,
 
     log_info("Attack finished: tested=%s elapsed=%s speed=%s",
              total_str, elapsed_str, speed_str);
+
+    if (out_total_tested) {
+        *out_total_tested = total;
+    }
+    if (out_elapsed_sec) {
+        *out_elapsed_sec = elapsed;
+    }
+    if (out_password && out_password_len > 0) {
+        if (result == ATTACK_RESULT_FOUND) {
+            snprintf(out_password, out_password_len, "%s", eng.found_password);
+        } else {
+            out_password[0] = '\0';
+        }
+    }
 
     /* Handle found password output */
     if (result == ATTACK_RESULT_FOUND) {
@@ -1141,9 +1178,9 @@ attack_result_t engine_run(const config_t *cfg,
                  "%s", cfg->wordlist_path);
         if (atk_pool.count > 0) {
             rs.wordlist_offset  = attack_ctx_get_dict_offset(
-                                    &atk_pool.contexts[0]);
+                                    attack_pool_ctx(&atk_pool, 0));
             rs.bruteforce_index = attack_ctx_get_brute_index(
-                                    &atk_pool.contexts[0]);
+                                    attack_pool_ctx(&atk_pool, 0));
         }
         if (resume_save(cfg->resume_path, &rs) == 0) {
             log_info("Resume state saved to: %s", cfg->resume_path);
@@ -1208,39 +1245,44 @@ benchmark_result_t engine_benchmark(const config_t *cfg,
         }
     }
 
-    /* Progress display during benchmark */
-    if (cfg->show_progress && cfg->interactive) {
-        int steps = duration_ms / 500;
-        for (int s = 0; s < steps; s++) {
-            sleep_ms(500);
-            engine_update_speed(&eng);
+    /* Monitor aggregate speed and track global peak throughput. */
+    double peak_speed = 0.0;
+    while (true) {
+        sleep_ms(100);
+        uint64_t total = atomic_load_explicit(&eng.total_attempts,
+                                              memory_order_relaxed);
+        double elapsed = elapsed_seconds_since(&start);
+        if (elapsed <= 0.0) {
+            continue;
+        }
 
-            uint64_t total = atomic_load_explicit(&eng.total_attempts,
-                                                   memory_order_relaxed);
-            double elapsed = elapsed_seconds_since(&start);
-            double speed   = (elapsed > 0.001)
-                             ? ((double)total / elapsed)
-                             : 0.0;
+        double speed = (double)total / elapsed;
+        if (speed > peak_speed) {
+            peak_speed = speed;
+        }
 
+        if (cfg->show_progress && cfg->interactive) {
             char speed_str[32];
             format_speed(speed_str, sizeof(speed_str), speed);
             fprintf(stderr, "\r  Benchmarking... %s (%.1fs)    ",
                     speed_str, elapsed);
             fflush(stderr);
         }
+
+        if (elapsed >= ((double)duration_ms / 1000.0)) {
+            break;
+        }
+    }
+    if (cfg->show_progress && cfg->interactive) {
         fprintf(stderr, "\n");
     }
 
     /* Join all benchmark workers */
     uint64_t total_hashes = 0;
-    double   peak_speed   = 0.0;
 
     for (int i = 0; i < cfg->num_threads; i++) {
         pthread_join(workers[i].tid, NULL);
         total_hashes += workers[i].count;
-        if (workers[i].speed > peak_speed) {
-            peak_speed = workers[i].speed;
-        }
     }
 
     double elapsed = elapsed_seconds_since(&start);
@@ -1251,6 +1293,9 @@ benchmark_result_t engine_benchmark(const config_t *cfg,
     res.total_speed  = (elapsed > 0.001)
                        ? ((double)total_hashes / elapsed)
                        : 0.0;
+    if (res.peak_speed < res.total_speed) {
+        res.peak_speed = res.total_speed;
+    }
 
     free(workers);
     engine_state_cleanup_local(&eng);
@@ -1390,17 +1435,10 @@ engine_run_result_t engine_orchestrate(const config_t *cfg,
     }
 
     /* Run main cracking engine */
-    struct timespec t_start = get_timespec_now();
-    res.result = engine_run(cfg, archive, p_resume);
-    double elapsed = elapsed_seconds_since(&t_start);
-
-    res.elapsed_sec  = elapsed;
-    res.total_tested = 0; /* will be updated below */
-
-    if (res.result == ATTACK_RESULT_FOUND) {
-        /* Password is printed by engine_run itself */
-        /* We just record it here */
-    }
+    res.result = engine_run(cfg, archive, p_resume,
+                            &res.total_tested,
+                            res.password, sizeof(res.password),
+                            &res.elapsed_sec);
 
     g_engine_for_signal = NULL;
 
@@ -1526,7 +1564,7 @@ attack_result_t engine_run_with_affinity(const config_t *cfg,
 
     /* Get keyspace */
     if (atk_pool.count > 0) {
-        eng.keyspace_total = attack_ctx_keyspace(&atk_pool.contexts[0]);
+        eng.keyspace_total = attack_ctx_keyspace(attack_pool_ctx(&atk_pool, 0));
     }
 
     worker_args_t *workers = (worker_args_t *)calloc(
@@ -1572,7 +1610,7 @@ attack_result_t engine_run_with_affinity(const config_t *cfg,
         workers[i].engine    = &eng;
         workers[i].config    = cfg;
         workers[i].archive   = &arch_pool.contexts[i];
-        workers[i].attack    = &atk_pool.contexts[i];
+        workers[i].attack    = attack_pool_ctx(&atk_pool, i);
         workers[i].started   = false;
 
         int rc = pthread_create(&workers[i].tid, &attr,
@@ -1618,7 +1656,7 @@ attack_result_t engine_run_with_affinity(const config_t *cfg,
     } else {
         bool all_done = true;
         for (int i = 0; i < atk_pool.count; i++) {
-            if (!attack_ctx_exhausted(&atk_pool.contexts[i])) {
+            if (!attack_ctx_exhausted(attack_pool_ctx_const(&atk_pool, i))) {
                 all_done = false;
                 break;
             }
@@ -1651,9 +1689,9 @@ attack_result_t engine_run_with_affinity(const config_t *cfg,
                  "%s", cfg->wordlist_path);
         if (atk_pool.count > 0) {
             rs.wordlist_offset  = attack_ctx_get_dict_offset(
-                                    &atk_pool.contexts[0]);
+                                    attack_pool_ctx(&atk_pool, 0));
             rs.bruteforce_index = attack_ctx_get_brute_index(
-                                    &atk_pool.contexts[0]);
+                                    attack_pool_ctx(&atk_pool, 0));
         }
         resume_save(cfg->resume_path, &rs);
         log_info("Resume state saved: %s", cfg->resume_path);
@@ -1824,7 +1862,6 @@ done:
 void engine_print_thread_stats(const engine_state_t *eng,
                                 bool no_color) {
     const char *c_l = no_color ? "" : "\033[97m";
-    const char *c_v = no_color ? "" : "\033[36m";
     const char *c_r = no_color ? "" : "\033[0m";
 
     fprintf(stderr, "%s[Thread Statistics]%s\n", c_l, c_r);
