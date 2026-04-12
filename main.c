@@ -284,8 +284,6 @@ typedef struct {
     bool                is_benchmark;
 } engine_run_result_t;
 
-/* Opaque archive context */
-typedef struct archive_ctx archive_ctx_t;
 
 /* ============================================================
  * EXTERNAL FUNCTION DECLARATIONS
