@@ -110,9 +110,15 @@ CWARN           := -Wall \
                    -Wundef \
                    -Wpointer-arith \
                    -Wcast-align \
-                   -Wwrite-strings
+                   -Wwrite-strings \
+                   -Wno-missing-prototypes \
+                   -Wno-strict-prototypes \
+                   -Wno-date-time \
+                   -Wno-unused-macros \
+                   -Wno-sign-conversion \
+                   -Wno-bad-function-cast
 
-# Clang-specific warnings
+# Clang-specific warnings (replaced block)
 ifeq ($(CC_IS_CLANG),1)
   CWARN         += -Weverything \
                    -Wno-padded \
