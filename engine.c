@@ -77,13 +77,6 @@ typedef enum {
     ATTACK_MAX
 } attack_mode_t;
 
-typedef enum {
-    ARCHIVE_UNKNOWN = 0,
-    ARCHIVE_ZIP     = 1,
-    ARCHIVE_7Z      = 2,
-    ARCHIVE_MAX
-} archive_type_t;
-
 typedef struct {
     char    chars[MAX_CHARSET_LEN];
     int     len;
