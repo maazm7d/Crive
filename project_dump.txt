@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 18:24:40 UTC 2026
+Generated: Sun Apr 12 19:34:20 UTC 2026
 ==============================
 
 FILE TREE:
@@ -748,23 +748,6 @@ typedef struct {
 
 typedef struct attack_ctx attack_ctx_t;
 
-struct attack_ctx {
-    attack_mode_t   mode;
-    int             thread_id;
-    int             num_threads;
-    uint64_t        total_generated;
-    bool            initialized;
-    union {
-        /* Dict state fields - enough space for all states */
-        uint8_t     _dict_state[sizeof(void*) * 256];
-        uint8_t     _brute_state[sizeof(void*) * 256];
-        uint8_t     _mask_state[sizeof(void*) * 256];
-        uint8_t     _rule_state[sizeof(void*) * 256];
-        uint8_t     _hybrid_state[sizeof(void*) * 256];
-    };
-    const void *config_ref;
-};
-
 /* Declared in attacks.c */
 extern int  attack_ctx_init_dict   (attack_ctx_t *ctx,
                                      const char *wordlist_path,
@@ -800,6 +783,7 @@ extern void attack_ctx_get_state   (const attack_ctx_t *ctx,
 extern uint64_t attack_ctx_keyspace(const attack_ctx_t *ctx);
 extern uint64_t attack_ctx_get_dict_offset  (const attack_ctx_t *ctx);
 extern uint64_t attack_ctx_get_brute_index  (const attack_ctx_t *ctx);
+extern size_t attack_ctx_size               (void);
 
 #include "archive.h"
 
@@ -1077,25 +1061,39 @@ static void archive_pool_free(archive_pool_t *pool) {
  * ============================================================ */
 
 typedef struct {
-    attack_ctx_t   *contexts;
+    uint8_t        *storage;
+    size_t          ctx_size;
     int             count;
     bool            initialized;
 } attack_pool_t;
+
+static attack_ctx_t *attack_pool_ctx(attack_pool_t *pool, int idx) {
+    return (attack_ctx_t *)(void *)(pool->storage + ((size_t)idx * pool->ctx_size));
+}
+
+static const attack_ctx_t *attack_pool_ctx_const(const attack_pool_t *pool, int idx) {
+    return (const attack_ctx_t *)(const void *)(pool->storage + ((size_t)idx * pool->ctx_size));
+}
 
 static int attack_pool_init(attack_pool_t *pool,
                               const config_t *cfg,
                               int num_threads,
                               const resume_state_t *resume_st) {
     pool->count    = num_threads;
-    pool->contexts = (attack_ctx_t *)calloc((size_t)num_threads,
-                                             sizeof(attack_ctx_t));
-    if (!pool->contexts) {
+    pool->ctx_size = attack_ctx_size();
+    if (pool->ctx_size == 0) {
+        log_error("attack_pool_init: invalid attack context size");
+        return -1;
+    }
+
+    pool->storage = (uint8_t *)calloc((size_t)num_threads, pool->ctx_size);
+    if (!pool->storage) {
         log_error("attack_pool_init: calloc failed");
         return -1;
     }
 
     for (int i = 0; i < num_threads; i++) {
-        attack_ctx_t *ctx = &pool->contexts[i];
+        attack_ctx_t *ctx = attack_pool_ctx(pool, i);
         int rc = 0;
 
         uint64_t dict_offset = 0;
@@ -1184,10 +1182,11 @@ static int attack_pool_init(attack_pool_t *pool,
             log_error("attack_pool_init: init failed for thread %d", i);
             /* Cleanup already-initialized ones */
             for (int j = 0; j < i; j++) {
-                attack_ctx_cleanup(&pool->contexts[j]);
+                attack_ctx_cleanup(attack_pool_ctx(pool, j));
             }
-            free(pool->contexts);
-            pool->contexts = NULL;
+            free(pool->storage);
+            pool->storage = NULL;
+            pool->ctx_size = 0;
             return -1;
         }
     }
@@ -1199,10 +1198,11 @@ static int attack_pool_init(attack_pool_t *pool,
 static void attack_pool_free(attack_pool_t *pool) {
     if (!pool || !pool->initialized) return;
     for (int i = 0; i < pool->count; i++) {
-        attack_ctx_cleanup(&pool->contexts[i]);
+        attack_ctx_cleanup(attack_pool_ctx(pool, i));
     }
-    free(pool->contexts);
-    pool->contexts    = NULL;
+    free(pool->storage);
+    pool->storage     = NULL;
+    pool->ctx_size    = 0;
     pool->count       = 0;
     pool->initialized = false;
 }
@@ -1290,7 +1290,7 @@ static void *resume_thread_fn(void *arg) {
 
         /* Get state from thread 0 */
         if (ra->attack_pool && ra->attack_pool->count > 0) {
-            attack_ctx_t *ctx0 = &ra->attack_pool->contexts[0];
+            attack_ctx_t *ctx0 = attack_pool_ctx(ra->attack_pool, 0);
             rs.wordlist_offset  = attack_ctx_get_dict_offset(ctx0);
             rs.bruteforce_index = attack_ctx_get_brute_index(ctx0);
         }
@@ -1348,9 +1348,7 @@ static void *worker_thread_fn(void *arg) {
         int n = attack_ctx_next_batch(atk, &batch);
         if (n <= 0) {
             /* Exhausted or error */
-            log_debug("Worker %d: attack exhausted (generated=%llu)",
-                      tid,
-                      (unsigned long long)atk->total_generated);
+            log_debug("Worker %d: attack exhausted", tid);
             break;
         }
 
@@ -1531,7 +1529,7 @@ attack_result_t engine_run(const config_t *cfg,
 
     /* Get keyspace estimate */
     if (atk_pool.count > 0) {
-        uint64_t ks = attack_ctx_keyspace(&atk_pool.contexts[0]);
+        uint64_t ks = attack_ctx_keyspace(attack_pool_ctx(&atk_pool, 0));
         eng.keyspace_total = ks;
         if (ks > 0) {
             char ks_str[32];
@@ -1593,7 +1591,7 @@ attack_result_t engine_run(const config_t *cfg,
         workers[i].engine    = &eng;
         workers[i].config    = cfg;
         workers[i].archive   = &arch_pool.contexts[i];
-        workers[i].attack    = &atk_pool.contexts[i];
+        workers[i].attack    = attack_pool_ctx(&atk_pool, i);
         workers[i].started   = false;
 
         int rc = pthread_create(&workers[i].tid, NULL,
@@ -1648,7 +1646,7 @@ attack_result_t engine_run(const config_t *cfg,
         /* Check if all attack contexts exhausted */
         bool all_exhausted = true;
         for (int i = 0; i < atk_pool.count; i++) {
-            if (!attack_ctx_exhausted(&atk_pool.contexts[i])) {
+            if (!attack_ctx_exhausted(attack_pool_ctx_const(&atk_pool, i))) {
                 all_exhausted = false;
                 break;
             }
@@ -1702,9 +1700,9 @@ attack_result_t engine_run(const config_t *cfg,
                  "%s", cfg->wordlist_path);
         if (atk_pool.count > 0) {
             rs.wordlist_offset  = attack_ctx_get_dict_offset(
-                                    &atk_pool.contexts[0]);
+                                    attack_pool_ctx(&atk_pool, 0));
             rs.bruteforce_index = attack_ctx_get_brute_index(
-                                    &atk_pool.contexts[0]);
+                                    attack_pool_ctx(&atk_pool, 0));
         }
         if (resume_save(cfg->resume_path, &rs) == 0) {
             log_info("Resume state saved to: %s", cfg->resume_path);
@@ -2087,7 +2085,7 @@ attack_result_t engine_run_with_affinity(const config_t *cfg,
 
     /* Get keyspace */
     if (atk_pool.count > 0) {
-        eng.keyspace_total = attack_ctx_keyspace(&atk_pool.contexts[0]);
+        eng.keyspace_total = attack_ctx_keyspace(attack_pool_ctx(&atk_pool, 0));
     }
 
     worker_args_t *workers = (worker_args_t *)calloc(
@@ -2133,7 +2131,7 @@ attack_result_t engine_run_with_affinity(const config_t *cfg,
         workers[i].engine    = &eng;
         workers[i].config    = cfg;
         workers[i].archive   = &arch_pool.contexts[i];
-        workers[i].attack    = &atk_pool.contexts[i];
+        workers[i].attack    = attack_pool_ctx(&atk_pool, i);
         workers[i].started   = false;
 
         int rc = pthread_create(&workers[i].tid, &attr,
@@ -2179,7 +2177,7 @@ attack_result_t engine_run_with_affinity(const config_t *cfg,
     } else {
         bool all_done = true;
         for (int i = 0; i < atk_pool.count; i++) {
-            if (!attack_ctx_exhausted(&atk_pool.contexts[i])) {
+            if (!attack_ctx_exhausted(attack_pool_ctx_const(&atk_pool, i))) {
                 all_done = false;
                 break;
             }
@@ -2212,9 +2210,9 @@ attack_result_t engine_run_with_affinity(const config_t *cfg,
                  "%s", cfg->wordlist_path);
         if (atk_pool.count > 0) {
             rs.wordlist_offset  = attack_ctx_get_dict_offset(
-                                    &atk_pool.contexts[0]);
+                                    attack_pool_ctx(&atk_pool, 0));
             rs.bruteforce_index = attack_ctx_get_brute_index(
-                                    &atk_pool.contexts[0]);
+                                    attack_pool_ctx(&atk_pool, 0));
         }
         resume_save(cfg->resume_path, &rs);
         log_info("Resume state saved: %s", cfg->resume_path);
@@ -2434,9 +2432,6 @@ FILE: ./attacks.c
  * Dictionary, Brute-Force, Mask, Hybrid, Rule-Based attacks
  * C11 standard, optimized for Termux/Android Linux
  */
-
-#define _GNU_SOURCE
-#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -4530,6 +4525,10 @@ uint64_t attack_ctx_get_brute_index(const attack_ctx_t *ctx) {
         return ctx->mask.cur_index;
     }
     return 0;
+}
+
+size_t attack_ctx_size(void) {
+    return sizeof(attack_ctx_t);
 }
 
 /* ============================================================
@@ -10299,6 +10298,7 @@ FILE: ./archive.c
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <pthread.h>
 #include <math.h>
 
@@ -10332,14 +10332,18 @@ void log_message(log_level_t level, const char *fmt, ...);
 extern uint32_t g_crc32_table[256];
 void crc32_init(void);
 
+/*
+ * ZIP classic crypto uses the internal PKZIP CRC state update
+ * (no pre/post bit inversion), which differs from the "full CRC32"
+ * helper used elsewhere.
+ */
 FORCE_INLINE uint32_t crc32_update(uint32_t crc,
                                     const uint8_t *data,
                                     size_t len) {
-    crc = ~crc;
     while (len--) {
         crc = g_crc32_table[(crc ^ *data++) & 0xFF] ^ (crc >> 8);
     }
-    return ~crc;
+    return crc;
 }
 
 /* ============================================================
@@ -11112,7 +11116,7 @@ FORCE_INLINE void zip_update_keys(zip_keys_t *keys, uint8_t c) {
 
 FORCE_INLINE uint8_t zip_decrypt_byte(const zip_keys_t *keys) {
     uint16_t t = (uint16_t)(keys->k2 | 2);
-    return (uint8_t)((t * (t ^ 1)) >> 8);
+    return (uint8_t)(((uint32_t)t * (uint32_t)(t ^ 1U)) >> 8);
 }
 
 FORCE_INLINE uint8_t zip_decrypt_char(zip_keys_t *keys, uint8_t c) {
@@ -12173,9 +12177,56 @@ static void sz_derive_key(const char *password,
  *   - We use a heuristic: check if decrypted data looks like
  *     a valid 7z property block (starts with known property IDs)
  */
-bool sz_validate_password(const struct sz_ctx *ctx, const char *password) {
+static bool sz_validate_password_cli(const char *archive_path,
+                                     const char *password) {
+    if (!archive_path || !password || password[0] == '\0') {
+        return false;
+    }
+
+    char pwarg[MAX_PASSWORD_LEN + 3];
+    int n = snprintf(pwarg, sizeof(pwarg), "-p%s", password);
+    if (n <= 2 || (size_t)n >= sizeof(pwarg)) {
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return false;
+    }
+
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDOUT_FILENO);
+            (void)dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execlp("7z", "7z", "t", "-y", pwarg, archive_path, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return false;
+    }
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static bool sz_validate_password(const struct sz_ctx *ctx,
+                                 const char *password,
+                                 const char *archive_path) {
     if (UNLIKELY(!ctx || !ctx->parsed)) return false;
     if (UNLIKELY(!ctx->has_encrypted_streams)) return false;
+
+    /*
+     * 7z supports multiple coder chains and stream layouts, and reliable
+     * validation for both header-encrypted and data-only-encrypted archives
+     * requires a full decode pipeline. Use the 7z tester for correctness.
+     */
+    if (sz_validate_password_cli(archive_path, password)) {
+        return true;
+    }
 
     /* Derive AES key */
     uint8_t aes_key[32];
@@ -12350,7 +12401,7 @@ bool archive_validate_password(const archive_ctx_t *ctx,
             return zip_validate_password(&ctx->zip, password);
 
         case ARCHIVE_7Z:
-            return sz_validate_password(&ctx->sz, password);
+            return sz_validate_password(&ctx->sz, password, ctx->path);
 
         default:
             return false;
@@ -12524,7 +12575,7 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
     } else if (type == ARCHIVE_7Z) {
         while (true) {
             for (int i = 0; i < 10; i++) {
-                sz_validate_password(&sz_dummy, test_pw);
+                sz_validate_password(&sz_dummy, test_pw, NULL);
                 count++;
             }
             clock_gettime(CLOCK_MONOTONIC, &ts_end);
@@ -12549,5 +12600,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 18:24:40 UTC 2026
+Dump Completed: Sun Apr 12 19:34:20 UTC 2026
 ----------------------------------------
