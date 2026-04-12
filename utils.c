@@ -4,9 +4,6 @@
  * C11 standard, optimized for Termux/Android Linux
  */
 
-#define _GNU_SOURCE
-#define _POSIX_C_SOURCE 200809L
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,7 +95,7 @@
 #define PROGRESS_UPDATE_MS      250
 #define SPEED_SAMPLE_WINDOW     8
 #define MAX_STATUS_LINE         256
-#define RESUME_MAGIC            0xC01VE001UL   /* FIXED: was 0xCR1VE001UL */
+#define RESUME_MAGIC            0xC01EC001UL
 #define RESUME_VERSION          1
 
 /* ============================================================
@@ -1036,9 +1033,8 @@ const char *spinner_next(bool use_unicode) {
 void print_banner(bool no_color) {
     const char *c_h  = no_color ? "" : ANSI_BRIGHT_MAGENTA ANSI_BOLD;
     const char *c_r  = no_color ? "" : ANSI_RESET;
-    const char *c_v  = no_color ? "" : ANSI_BRIGHT_CYAN;
-    const char *c_d  = no_color ? "" : ANSI_DIM;
     const char *c_y  = no_color ? "" : ANSI_BRIGHT_YELLOW;
+    (void)c_y;
 
     fprintf(stderr,
         "%s╔══════════════════════════════════════════════════════════╗%s\n"
@@ -1193,6 +1189,7 @@ void status_line_update(const engine_state_t *state, bool no_color) {
 
     const char *c_l  = nc ? "" : CLR_LABEL;
     const char *c_v  = nc ? "" : CLR_VALUE;
+        (void)c_v;
     const char *c_sp = nc ? "" : CLR_SPEED;
     const char *c_r  = nc ? "" : ANSI_RESET;
     const char *c_d  = nc ? "" : ANSI_DIM;
