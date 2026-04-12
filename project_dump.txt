@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 14:27:21 UTC 2026
+Generated: Sun Apr 12 14:33:07 UTC 2026
 ==============================
 
 FILE TREE:
@@ -8278,6 +8278,7 @@ FILE: ./main.c
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <locale.h>
+#include "archive.h"
 
 /* ============================================================
  * ALL TYPES REDECLARED HERE FOR STANDALONE COMPILATION
@@ -12456,5 +12457,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 14:27:21 UTC 2026
+Dump Completed: Sun Apr 12 14:33:07 UTC 2026
 ----------------------------------------
