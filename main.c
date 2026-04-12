@@ -967,8 +967,11 @@ static void display_config_summary(const config_t *cfg) {
             /* Show charset summary */
             char cs_display[64];
             if (cfg->charset.len <= 20) {
-                snprintf(cs_display, sizeof(cs_display), "%s (%d chars)",
-                         cfg->charset.chars, cfg->charset.len);
+                int max_cs = (int)sizeof(cs_display) - 16;
+                if (max_cs < 0) max_cs = 0;
+                snprintf(cs_display, sizeof(cs_display),
+                         "%.*s (%d chars)",
+                         max_cs, cfg->charset.chars, cfg->charset.len);
             } else {
                 snprintf(cs_display, sizeof(cs_display),
                          "%.20s... (%d chars)",
@@ -1235,9 +1238,8 @@ static void display_result(attack_result_t result,
     char elapsed_str[32], total_str[32], speed_str[32];
     format_elapsed(elapsed_str, sizeof(elapsed_str), elapsed_sec);
     format_number(total_str, sizeof(total_str), total_tested);
-    double speed = (elapsed_sec > 0.001)
-                   ? ((double)total_tested / elapsed_sec)
-                   : 0.0;
+    double safe_elapsed = (elapsed_sec > 1e-9) ? elapsed_sec : 1e-9;
+    double speed = ((double)total_tested / safe_elapsed);
     format_speed(speed_str, sizeof(speed_str), speed);
 
     switch (result) {

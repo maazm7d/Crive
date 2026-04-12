@@ -708,8 +708,16 @@ static void *resume_thread_fn(void *arg) {
     while (ra->running &&
            !engine_is_found(eng) &&
            !engine_is_shutdown(eng)) {
-
-        sleep_ms(RESUME_SAVE_INTERVAL_SEC * 1000L);
+        /* Sleep in short slices so shutdown/found can stop promptly. */
+        int wait_ms = RESUME_SAVE_INTERVAL_SEC * 1000;
+        while (wait_ms > 0 &&
+               ra->running &&
+               !engine_is_found(eng) &&
+               !engine_is_shutdown(eng)) {
+            int step = (wait_ms > 200) ? 200 : wait_ms;
+            sleep_ms(step);
+            wait_ms -= step;
+        }
 
         if (!ra->running || engine_is_found(eng)) break;
 
@@ -774,6 +782,8 @@ static void *worker_thread_fn(void *arg) {
 
     log_debug("Worker %d: started", tid);
 
+    uint64_t local_count = 0;
+
     while (LIKELY(!engine_is_found(eng) &&
                   !engine_is_shutdown(eng))) {
 
@@ -806,6 +816,9 @@ static void *worker_thread_fn(void *arg) {
                 ts->current_password[pw_len] = '\0';
             }
 
+            ts->attempts++;
+            local_count++;
+
             /* THE CORE CHECK */
             if (UNLIKELY(archive_validate_password(arch, pw))) {
                 engine_set_found(eng, pw);
@@ -813,14 +826,15 @@ static void *worker_thread_fn(void *arg) {
                 log_debug("Worker %d: found password '%s'", tid, pw);
                 goto done;
             }
-
-            ts->attempts++;
         }
 
         /* Batch done - update global counter atomically */
-        atomic_fetch_add_explicit(&eng->total_attempts,
-                                   (uint_fast64_t)n,
-                                   memory_order_relaxed);
+        if (local_count > 0) {
+            atomic_fetch_add_explicit(&eng->total_attempts,
+                                       (uint_fast64_t)local_count,
+                                       memory_order_relaxed);
+            local_count = 0;
+        }
 
         /* Check global limit */
         if (cfg->limit > 0) {
@@ -834,6 +848,11 @@ static void *worker_thread_fn(void *arg) {
     }
 
 done:
+    if (local_count > 0) {
+        atomic_fetch_add_explicit(&eng->total_attempts,
+                                   (uint_fast64_t)local_count,
+                                   memory_order_relaxed);
+    }
     ts->running = false;
     log_debug("Worker %d: done (attempts=%llu)", tid,
               (unsigned long long)ts->attempts);
@@ -911,7 +930,9 @@ static void *bench_worker_fn(void *arg) {
                 : 0.0;
 
     /* Prevent compiler from eliminating the loop */
-    if (result == 0xDEADBEEFU) fprintf(stderr, "");
+    if (result == 0xDEADBEEFU) {
+        fputc('\n', stderr);
+    }
 
     return NULL;
 }
@@ -935,7 +956,11 @@ typedef enum {
 
 attack_result_t engine_run(const config_t *cfg,
                             archive_ctx_t *master_archive,
-                            const resume_state_t *resume_st) {
+                            const resume_state_t *resume_st,
+                            uint64_t *out_total_tested,
+                            char *out_password,
+                            size_t out_password_len,
+                            double *out_elapsed_sec) {
     log_info("Engine starting: mode=%d threads=%d",
              cfg->attack_mode, cfg->num_threads);
 
@@ -1111,6 +1136,20 @@ attack_result_t engine_run(const config_t *cfg,
     log_info("Attack finished: tested=%s elapsed=%s speed=%s",
              total_str, elapsed_str, speed_str);
 
+    if (out_total_tested) {
+        *out_total_tested = total;
+    }
+    if (out_elapsed_sec) {
+        *out_elapsed_sec = elapsed;
+    }
+    if (out_password && out_password_len > 0) {
+        if (result == ATTACK_RESULT_FOUND) {
+            snprintf(out_password, out_password_len, "%s", eng.found_password);
+        } else {
+            out_password[0] = '\0';
+        }
+    }
+
     /* Handle found password output */
     if (result == ATTACK_RESULT_FOUND) {
         print_found_password(eng.found_password, cfg->archive_path,
@@ -1206,39 +1245,44 @@ benchmark_result_t engine_benchmark(const config_t *cfg,
         }
     }
 
-    /* Progress display during benchmark */
-    if (cfg->show_progress && cfg->interactive) {
-        int steps = duration_ms / 500;
-        for (int s = 0; s < steps; s++) {
-            sleep_ms(500);
-            engine_update_speed(&eng);
+    /* Monitor aggregate speed and track global peak throughput. */
+    double peak_speed = 0.0;
+    while (true) {
+        sleep_ms(100);
+        uint64_t total = atomic_load_explicit(&eng.total_attempts,
+                                              memory_order_relaxed);
+        double elapsed = elapsed_seconds_since(&start);
+        if (elapsed <= 0.0) {
+            continue;
+        }
 
-            uint64_t total = atomic_load_explicit(&eng.total_attempts,
-                                                   memory_order_relaxed);
-            double elapsed = elapsed_seconds_since(&start);
-            double speed   = (elapsed > 0.001)
-                             ? ((double)total / elapsed)
-                             : 0.0;
+        double speed = (double)total / elapsed;
+        if (speed > peak_speed) {
+            peak_speed = speed;
+        }
 
+        if (cfg->show_progress && cfg->interactive) {
             char speed_str[32];
             format_speed(speed_str, sizeof(speed_str), speed);
             fprintf(stderr, "\r  Benchmarking... %s (%.1fs)    ",
                     speed_str, elapsed);
             fflush(stderr);
         }
+
+        if (elapsed >= ((double)duration_ms / 1000.0)) {
+            break;
+        }
+    }
+    if (cfg->show_progress && cfg->interactive) {
         fprintf(stderr, "\n");
     }
 
     /* Join all benchmark workers */
     uint64_t total_hashes = 0;
-    double   peak_speed   = 0.0;
 
     for (int i = 0; i < cfg->num_threads; i++) {
         pthread_join(workers[i].tid, NULL);
         total_hashes += workers[i].count;
-        if (workers[i].speed > peak_speed) {
-            peak_speed = workers[i].speed;
-        }
     }
 
     double elapsed = elapsed_seconds_since(&start);
@@ -1249,6 +1293,9 @@ benchmark_result_t engine_benchmark(const config_t *cfg,
     res.total_speed  = (elapsed > 0.001)
                        ? ((double)total_hashes / elapsed)
                        : 0.0;
+    if (res.peak_speed < res.total_speed) {
+        res.peak_speed = res.total_speed;
+    }
 
     free(workers);
     engine_state_cleanup_local(&eng);
@@ -1388,17 +1435,10 @@ engine_run_result_t engine_orchestrate(const config_t *cfg,
     }
 
     /* Run main cracking engine */
-    struct timespec t_start = get_timespec_now();
-    res.result = engine_run(cfg, archive, p_resume);
-    double elapsed = elapsed_seconds_since(&t_start);
-
-    res.elapsed_sec  = elapsed;
-    res.total_tested = 0; /* will be updated below */
-
-    if (res.result == ATTACK_RESULT_FOUND) {
-        /* Password is printed by engine_run itself */
-        /* We just record it here */
-    }
+    res.result = engine_run(cfg, archive, p_resume,
+                            &res.total_tested,
+                            res.password, sizeof(res.password),
+                            &res.elapsed_sec);
 
     g_engine_for_signal = NULL;
 
@@ -1822,7 +1862,6 @@ done:
 void engine_print_thread_stats(const engine_state_t *eng,
                                 bool no_color) {
     const char *c_l = no_color ? "" : "\033[97m";
-    const char *c_v = no_color ? "" : "\033[36m";
     const char *c_r = no_color ? "" : "\033[0m";
 
     fprintf(stderr, "%s[Thread Statistics]%s\n", c_l, c_r);

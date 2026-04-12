@@ -1237,7 +1237,7 @@ static int rule_set_load(rule_set_t *rs, const char *path) {
 
         rule_entry_t *e = &rs->entries[idx];
         memset(e, 0, sizeof(*e));
-        snprintf(e->param, sizeof(e->param), "%s", line);
+        snprintf(e->param, sizeof(e->param), "%.63s", line);
 
         if      (strcmp(line, "capitalize")    == 0) {
             e->type = RULE_CAPITALIZE;
