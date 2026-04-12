@@ -830,45 +830,33 @@ static void *worker_thread_fn(void *arg) {
                 goto done;
             }
         }
-
-        /* Batch done - update global counter atomically */
-        if (local_count > 0) {
-            if (local_count >= ATTEMPT_FLUSH_THRESHOLD || n < batch.capacity) {
-                atomic_fetch_add_explicit(&eng->total_attempts,
-                                           (uint_fast64_t)local_count,
-                                           memory_order_relaxed);
-                local_count = 0;
-            }
-        }
-
-        /* Check global limit */
-        if (cfg->limit > 0) {
-            if (local_count > 0) {
-                atomic_fetch_add_explicit(&eng->total_attempts,
-                                           (uint_fast64_t)local_count,
-                                           memory_order_relaxed);
-                local_count = 0;
-            }
-            uint64_t total = atomic_load_explicit(&eng->total_attempts,
-                                                   memory_order_relaxed);
-            if (total >= cfg->limit) {
-                log_debug("Worker %d: limit reached", tid);
-                break;
-            }
-        }
-    }
-
-done:
-    if (local_count > 0) {
+/* Batch done - update global counter atomically (buffered) */
+if (local_count > 0) {
+    if (local_count >= ATTEMPT_FLUSH_THRESHOLD || n < batch.capacity) {
         atomic_fetch_add_explicit(&eng->total_attempts,
-                                   (uint_fast64_t)local_count,
-                                   memory_order_relaxed);
+                                  (uint_fast64_t)local_count,
+                                  memory_order_relaxed);
+        local_count = 0;
     }
-    ts->running = false;
-    log_debug("Worker %d: done (attempts=%llu)", tid,
-              (unsigned long long)ts->attempts);
-    return NULL;
 }
+
+/* Ensure accurate accounting before limit check */
+if (cfg->limit > 0 && local_count > 0) {
+    atomic_fetch_add_explicit(&eng->total_attempts,
+                              (uint_fast64_t)local_count,
+                              memory_order_relaxed);
+    local_count = 0;
+}
+
+/* Check global limit */
+if (cfg->limit > 0) {
+    uint64_t total = atomic_load_explicit(&eng->total_attempts,
+                                          memory_order_relaxed);
+    if (total >= cfg->limit) {
+        break;
+    }
+}
+
 
 /* ============================================================
  * BENCHMARK WORKER
