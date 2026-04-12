@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 17:36:54 UTC 2026
+Generated: Sun Apr 12 17:43:34 UTC 2026
 ==============================
 
 FILE TREE:
@@ -2292,9 +2292,6 @@ FILE: ./attacks.c
  * Dictionary, Brute-Force, Mask, Hybrid, Rule-Based attacks
  * C11 standard, optimized for Termux/Android Linux
  */
-
-#define _GNU_SOURCE
-#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12410,5 +12407,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 17:36:54 UTC 2026
+Dump Completed: Sun Apr 12 17:43:34 UTC 2026
 ----------------------------------------
