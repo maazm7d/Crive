@@ -98,7 +98,7 @@
 #define PROGRESS_UPDATE_MS      250
 #define SPEED_SAMPLE_WINDOW     8
 #define MAX_STATUS_LINE         256
-#define RESUME_MAGIC            0xCR1VE001UL
+#define RESUME_MAGIC            0xC01VE001UL   /* FIXED: was 0xCR1VE001UL */
 #define RESUME_VERSION          1
 
 /* ============================================================
@@ -967,7 +967,7 @@ void render_progress_bar(char *buf, size_t buflen,
     }
 
     for (int i = 0; i < filled; i++) {
-        if (pos < (int)sizeof(tmp) - 2) {
+        if (pos < (int)((int)sizeof(tmp) - (int)sizeof(ANSI_RESET) - 1)) {
             tmp[pos++] = '=';
         }
     }
@@ -977,12 +977,12 @@ void render_progress_bar(char *buf, size_t buflen,
     }
 
     if (!no_color) {
-        if (pos < (int)sizeof(tmp) - sizeof(ANSI_RESET) - 1) {
+        if (pos < (int)((int)sizeof(tmp) - (int)sizeof(ANSI_RESET) - 1)) {
             memcpy(tmp + pos, ANSI_RESET, strlen(ANSI_RESET));
             pos += strlen(ANSI_RESET);
         }
         if (!no_color) {
-            if (pos < (int)sizeof(tmp) - sizeof(ANSI_DIM) - 1) {
+            if (pos < (int)((int)sizeof(tmp) - (int)sizeof(ANSI_DIM) - 1)) {
                 memcpy(tmp + pos, ANSI_DIM, strlen(ANSI_DIM));
                 pos += strlen(ANSI_DIM);
             }
@@ -996,7 +996,7 @@ void render_progress_bar(char *buf, size_t buflen,
     }
 
     if (!no_color) {
-        if (pos < (int)sizeof(tmp) - sizeof(ANSI_RESET) - 1) {
+        if (pos < (int)((int)sizeof(tmp) - (int)sizeof(ANSI_RESET) - 1)) {
             memcpy(tmp + pos, ANSI_RESET, strlen(ANSI_RESET));
             pos += strlen(ANSI_RESET);
         }
@@ -1035,34 +1035,33 @@ const char *spinner_next(bool use_unicode) {
 
 void print_banner(bool no_color) {
     const char *c_h  = no_color ? "" : ANSI_BRIGHT_MAGENTA ANSI_BOLD;
-    const char *c_v  = no_color ? "" : ANSI_BRIGHT_CYAN;
     const char *c_r  = no_color ? "" : ANSI_RESET;
+    const char *c_v  = no_color ? "" : ANSI_BRIGHT_CYAN;
     const char *c_d  = no_color ? "" : ANSI_DIM;
     const char *c_y  = no_color ? "" : ANSI_BRIGHT_YELLOW;
 
     fprintf(stderr,
         "%s╔══════════════════════════════════════════════════════════╗%s\n"
-        "%s║%s  %s ██████╗██████╗ ██╗██╗   ██╗███████╗               %s║%s\n"
-        "%s║%s  %s██╔════╝██╔══██╗██║██║   ██║██╔════╝               %s║%s\n"
-        "%s║%s  %s██║     ██████╔╝██║██║   ██║█████╗                 %s║%s\n"
-        "%s║%s  %s██║     ██╔══██╗██║╚██╗ ██╔╝██╔══╝                 %s║%s\n"
-        "%s║%s  %s╚██████╗██║  ██║██║ ╚████╔╝ ███████╗               %s║%s\n"
-        "%s║%s  %s ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝               %s║%s\n"
-        "%s║%s  %sArchive Password Recovery Framework v%s             %s║%s\n"
-        "%s║%s  %s%sPlatform: %s%-20s  CPU-Only Engine%s               %s║%s\n"
-        "%s╚══════════════════════════════════════════════════════════╝%s\n",
+        "%s║  ██████╗██████╗ ██╗██╗   ██╗███████╗                    ║%s\n"
+        "%s║ ██╔════╝██╔══██╗██║██║   ██║██╔════╝                    ║%s\n"
+        "%s║ ██║     ██████╔╝██║██║   ██║█████╗                      ║%s\n"
+        "%s║ ██║     ██╔══██╗██║╚██╗ ██╔╝██╔══╝                      ║%s\n"
+        "%s║ ╚██████╗██║  ██║██║ ╚████╔╝ ███████╗                    ║%s\n"
+        "%s║  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝  ╚══════╝                   ║%s\n"
+        "%s║  Archive Password Recovery Framework v%-6s             ║%s\n"
+        "%s║  Platform: %-20s  CPU-Only Engine       ║%s\n"
+        "%s╚══════════════════════════════════════════════════════════╝%s\n\n",
         c_h, c_r,
-        c_h, c_r, c_v, c_h, c_r,
-        c_h, c_r, c_v, c_h, c_r,
-        c_h, c_r, c_v, c_h, c_r,
-        c_h, c_r, c_v, c_h, c_r,
-        c_h, c_r, c_v, c_h, c_r,
-        c_h, c_r, c_v, c_h, c_r,
-        c_h, c_r, c_y, CRIVE_VERSION_STR, c_h, c_r,
-        c_h, c_r, c_d, c_y, PLATFORM_NAME, c_r, c_h, c_r,
+        c_h, c_r,
+        c_h, c_r,
+        c_h, c_r,
+        c_h, c_r,
+        c_h, c_r,
+        c_h, c_r,
+        c_h, CRIVE_VERSION_STR, c_r,
+        c_h, PLATFORM_NAME, c_r,
         c_h, c_r
     );
-    fprintf(stderr, "\n");
 }
 
 void print_section_header(const char *title, bool no_color) {
@@ -1911,7 +1910,7 @@ static void print_usage(const char *progname) {
             "                  Maximum password length [8]\n"
         "  " ANSI_CYAN "--charset <spec>" ANSI_RESET
             "           Charset spec: lower,upper,digits,special,alnum,...\n"
-        "                              or custom characters\n"
+            "                              or custom characters\n"
         "\n"
         ANSI_BRIGHT_WHITE "PERFORMANCE:" ANSI_RESET "\n"
         "  " ANSI_CYAN "-t, --threads <n>" ANSI_RESET
@@ -2459,6 +2458,9 @@ static void internal_signal_handler(int sig) {
     }
 }
 
+/* SIGWINCH wrapper */
+static void sigwinch_handler(int sig) { (void)sig; term_update_size(); }
+
 void signals_init(void (*handler)(int)) {
     g_signal_handler_cb = handler;
 
@@ -2475,7 +2477,7 @@ void signals_init(void (*handler)(int)) {
     /* Handle SIGWINCH for terminal resize */
     struct sigaction sa_win;
     memset(&sa_win, 0, sizeof(sa_win));
-    sa_win.sa_handler = (void(*)(int))term_update_size;
+    sa_win.sa_handler = sigwinch_handler;
     sigemptyset(&sa_win.sa_mask);
     sa_win.sa_flags = SA_RESTART;
     sigaction(SIGWINCH, &sa_win, NULL);
@@ -2740,15 +2742,21 @@ void hex_dump(const char *label, const uint8_t *data, size_t len) {
 #include <sched.h>
 
 int thread_set_affinity(pthread_t thread, int cpu_id) {
+#if defined(__linux__) && !defined(__ANDROID__)
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(cpu_id, &cpuset);
+    CPU_SET(cpu_id % (int)sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
     int rc = pthread_setaffinity_np(thread, sizeof(cpuset), &cpuset);
     if (rc != 0) {
         log_debug("thread_set_affinity: failed for cpu %d: %s",
                   cpu_id, strerror(rc));
     }
     return rc;
+#else
+    (void)thread;
+    (void)cpu_id;
+    return 0;
+#endif
 }
 
 int thread_set_priority(pthread_t thread, int priority) {
