@@ -16,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <pthread.h>
 #include <math.h>
 
@@ -1894,9 +1895,56 @@ static void sz_derive_key(const char *password,
  *   - We use a heuristic: check if decrypted data looks like
  *     a valid 7z property block (starts with known property IDs)
  */
-bool sz_validate_password(const struct sz_ctx *ctx, const char *password) {
+static bool sz_validate_password_cli(const char *archive_path,
+                                     const char *password) {
+    if (!archive_path || !password || password[0] == '\0') {
+        return false;
+    }
+
+    char pwarg[MAX_PASSWORD_LEN + 3];
+    int n = snprintf(pwarg, sizeof(pwarg), "-p%s", password);
+    if (n <= 2 || (size_t)n >= sizeof(pwarg)) {
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return false;
+    }
+
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDOUT_FILENO);
+            (void)dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execlp("7z", "7z", "t", "-y", pwarg, archive_path, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return false;
+    }
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static bool sz_validate_password(const struct sz_ctx *ctx,
+                                 const char *password,
+                                 const char *archive_path) {
     if (UNLIKELY(!ctx || !ctx->parsed)) return false;
     if (UNLIKELY(!ctx->has_encrypted_streams)) return false;
+
+    /*
+     * 7z supports multiple coder chains and stream layouts, and reliable
+     * validation for both header-encrypted and data-only-encrypted archives
+     * requires a full decode pipeline. Use the 7z tester for correctness.
+     */
+    if (sz_validate_password_cli(archive_path, password)) {
+        return true;
+    }
 
     /* Derive AES key */
     uint8_t aes_key[32];
@@ -2071,7 +2119,7 @@ bool archive_validate_password(const archive_ctx_t *ctx,
             return zip_validate_password(&ctx->zip, password);
 
         case ARCHIVE_7Z:
-            return sz_validate_password(&ctx->sz, password);
+            return sz_validate_password(&ctx->sz, password, ctx->path);
 
         default:
             return false;
@@ -2245,7 +2293,7 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
     } else if (type == ARCHIVE_7Z) {
         while (true) {
             for (int i = 0; i < 10; i++) {
-                sz_validate_password(&sz_dummy, test_pw);
+                sz_validate_password(&sz_dummy, test_pw, NULL);
                 count++;
             }
             clock_gettime(CLOCK_MONOTONIC, &ts_end);
