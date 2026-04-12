@@ -30,6 +30,7 @@
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <locale.h>
+#include "archive.h"
 
 /* ============================================================
  * ALL TYPES REDECLARED HERE FOR STANDALONE COMPILATION
