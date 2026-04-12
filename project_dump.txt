@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 17:56:39 UTC 2026
+Generated: Sun Apr 12 17:56:53 UTC 2026
 ==============================
 
 FILE TREE:
@@ -9,7 +9,6 @@ FILE TREE:
 .github
 .github/workflows
 .github/workflows/project-dump.yml
-.github/workflows/Compile.yml
 .github/workflows/pipeline.yml
 archive.h
 engine.c
@@ -188,67 +187,6 @@ jobs:
           echo "Repository: $GITHUB_REPOSITORY"
           echo "Run ID: $GITHUB_RUN_ID"
           echo "----------------------------------"
-
-========================================
-FILE: ./.github/workflows/Compile.yml
-========================================
-
-name: Verbose Build
-
-on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:          # allow manual trigger
-
-jobs:
-  build-verbose:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential gcc clang make
-
-      - name: Show environment info
-        run: |
-          echo "=== SYSTEM INFO ==="
-          uname -a
-          gcc --version
-          clang --version
-          make --version
-          echo "=================="
-
-      - name: Build with verbose compiler/linker flags
-        run: |
-          # Build with maximum verbosity:
-          #   -v for compiler internal steps
-          #   -Wl,--verbose for linker detailed output
-          #   Also disable @ suppression by overriding Q (if any) – not needed.
-          make termux
-        continue-on-error: false
-
-      - name: Archive build logs (if any)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: |
-            build/obj/*.o
-            build/dep/*.d
-            build/bin/crive
-            **/*.log
-          if-no-files-found: ignore
-
-      - name: Run built binary with version info
-        run: |
-          ./build/bin/crive --version
-          echo "=== Build completed successfully ==="
 
 ========================================
 FILE: ./.github/workflows/pipeline.yml
@@ -12699,5 +12637,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 17:56:39 UTC 2026
+Dump Completed: Sun Apr 12 17:56:53 UTC 2026
 ----------------------------------------
