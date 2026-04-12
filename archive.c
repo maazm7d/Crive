@@ -49,14 +49,18 @@ void log_message(log_level_t level, const char *fmt, ...);
 extern uint32_t g_crc32_table[256];
 void crc32_init(void);
 
+/*
+ * ZIP classic crypto uses the internal PKZIP CRC state update
+ * (no pre/post bit inversion), which differs from the "full CRC32"
+ * helper used elsewhere.
+ */
 FORCE_INLINE uint32_t crc32_update(uint32_t crc,
                                     const uint8_t *data,
                                     size_t len) {
-    crc = ~crc;
     while (len--) {
         crc = g_crc32_table[(crc ^ *data++) & 0xFF] ^ (crc >> 8);
     }
-    return ~crc;
+    return crc;
 }
 
 /* ============================================================
