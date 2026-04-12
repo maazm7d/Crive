@@ -4,9 +4,6 @@
  * C11 standard, optimized for Termux/Android Linux
  */
 
-#define _GNU_SOURCE
-#define _POSIX_C_SOURCE 200809L
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1240,7 +1237,7 @@ static int rule_set_load(rule_set_t *rs, const char *path) {
 
         rule_entry_t *e = &rs->entries[idx];
         memset(e, 0, sizeof(*e));
-        snprintf(e->param, sizeof(e->param), "%s", line);
+        snprintf(e->param, sizeof(e->param), "%.63s", line);
 
         if      (strcmp(line, "capitalize")    == 0) {
             e->type = RULE_CAPITALIZE;
@@ -2099,6 +2096,10 @@ uint64_t attack_ctx_get_brute_index(const attack_ctx_t *ctx) {
         return ctx->mask.cur_index;
     }
     return 0;
+}
+
+size_t attack_ctx_size(void) {
+    return sizeof(attack_ctx_t);
 }
 
 /* ============================================================
