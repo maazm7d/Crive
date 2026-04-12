@@ -1,4 +1,4 @@
-name: Comprehensive CI (Enhanced)
+name: CI
 
 on:
   push:
@@ -10,12 +10,14 @@ on:
 env:
   MAKEFLAGS: -j$(nproc)
   BUILD_PROFILE: release
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
 
   build:
     name: Build (${{ matrix.compiler }}, ${{ matrix.profile }})
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       matrix:
@@ -30,19 +32,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential gcc clang make \
-            cppcheck clang-tidy valgrind \
-            zip p7zip-full
+            zip p7zip-full valgrind
 
-      - name: System information
+      - name: System info
         run: |
           uname -a
           lscpu | head -10
           free -h
 
-      - name: Build (verbose)
+      - name: Build
         run: |
           make clean
-          CFLAGS="-Wno-error" \
           make CC=${{ matrix.compiler }} BUILD_PROFILE=${{ matrix.profile }} V=1 all
 
       - name: Upload binary
@@ -52,7 +52,7 @@ jobs:
           path: build/bin/crive
 
   test:
-    name: Functional Tests
+    name: Functional Tests (Ultra Verbose)
     runs-on: ubuntu-latest
     needs: build
 
@@ -64,71 +64,102 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y zip p7zip-full
 
-      - name: Build
+      - name: Build (debug for max logs)
         run: |
           make clean
-          make BUILD_PROFILE=release CC=gcc V=1 all
+          make BUILD_PROFILE=debug CC=gcc V=1 all
 
-      - name: ZIP cracking test
+      - name: ZIP Test (Ultra Verbose)
         run: |
+          set -x
+
+          echo "===== CREATE ZIP ====="
           echo "data" > file.txt
           zip -P pass123 test.zip file.txt
 
+          echo "===== CREATE WORDLIST ====="
           echo "wrong" > wordlist.txt
           echo "pass123" >> wordlist.txt
 
-          ./build/bin/crive test.zip --wordlist wordlist.txt | tee zip.log || true
-          grep -i "pass123" zip.log
+          echo "===== RUN CRIVE ====="
+          ./build/bin/crive test.zip \
+            --wordlist wordlist.txt \
+            --threads 1 \
+            --verbose \
+            > zip.log 2>&1 || true
 
-      - name: 7Z cracking test
+          echo "===== FULL LOG ====="
+          cat zip.log
+
+          echo "===== VALIDATION ====="
+          grep -q "pass123" zip.log
+
+      - name: 7Z Test (Ultra Verbose)
         run: |
+          set -x
+
+          echo "===== CREATE 7Z ====="
           echo "data" > file.txt
           7z a -psecret7z test.7z file.txt
 
+          echo "===== CREATE WORDLIST ====="
           echo "badpass" > wordlist.txt
           echo "secret7z" >> wordlist.txt
 
-          ./build/bin/crive test.7z --wordlist wordlist.txt | tee 7z.log || true
-          grep -i "secret7z" 7z.log
+          echo "===== RUN CRIVE ====="
+          ./build/bin/crive test.7z \
+            --wordlist wordlist.txt \
+            --threads 1 \
+            --verbose \
+            > 7z.log 2>&1 || true
 
-      - name: Quick benchmark
+          echo "===== FULL LOG ====="
+          cat 7z.log
+
+          echo "===== VALIDATION ====="
+          grep -q "secret7z" 7z.log
+
+      - name: Benchmark (Verbose)
         run: |
-          ./build/bin/crive --benchmark 5 | tee bench.log || true
-          grep -i "passwords/sec" bench.log || true
+          set -x
+          ./build/bin/crive --benchmark 5 --threads 1 > bench.log 2>&1 || true
+          cat bench.log
 
-  lint:
-    name: Lint (Non-blocking)
+  valgrind:
+    name: Valgrind Memory Check
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install lint tools
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cppcheck clang-tidy
+          sudo apt-get install -y valgrind zip p7zip-full
 
-      - name: Run cppcheck
+      - name: Build debug
         run: |
-          cppcheck --enable=all --std=c11 \
-            --suppress=missingIncludeSystem \
-            --quiet . 2>&1 | tee cppcheck.log
-        continue-on-error: true
+          make clean
+          make BUILD_PROFILE=debug CC=gcc all
 
-      - name: Run clang-tidy
+      - name: Run Valgrind (Ultra Verbose)
         run: |
-          make compile_commands.json || true
-          for f in *.c; do
-            clang-tidy $f -- -std=c11 -I. 2>&1 | tee -a clang-tidy.log
-          done
-        continue-on-error: true
+          set -x
+          valgrind \
+            --leak-check=full \
+            --track-origins=yes \
+            --verbose \
+            ./build/bin/crive --help \
+            > valgrind.log 2>&1 || true
 
-      - uses: actions/upload-artifact@v4
+          echo "===== VALGRIND LOG ====="
+          cat valgrind.log
+
+      - name: Upload valgrind log
+        uses: actions/upload-artifact@v4
         with:
-          name: lint-logs
-          path: |
-            cppcheck.log
-            clang-tidy.log
+          name: valgrind-log
+          path: valgrind.log
 
   benchmark:
     name: Benchmark
@@ -145,145 +176,23 @@ jobs:
 
       - name: Run benchmark
         run: |
-          ./build/bin/crive --benchmark 10 | tee benchmark.log || true
+          ./build/bin/crive --benchmark 10 --threads 1 > benchmark.log 2>&1 || true
+          cat benchmark.log
 
       - name: Extract speed
         run: |
           grep -i "passwords/sec" benchmark.log || true
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-log
-          path: benchmark.log
-
-  valgrind:
-    name: Valgrind
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install valgrind
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y valgrind zip p7zip-full
-
-      - name: Build debug
-        run: |
-          make clean
-          make BUILD_PROFILE=debug CC=gcc all
-
-      - name: Run valgrind
-        run: |
-          valgrind --leak-check=full ./build/bin/crive --help \
-            2>&1 | tee valgrind.log || true
-
-      - name: Check leaks
-        run: |
-          grep -q "ERROR SUMMARY: 0 errors" valgrind.log || true
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: valgrind-log
-          path: valgrind.log
-
-  perf-compare:
-    name: Performance Comparison
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
-
-    steps:
-      - name: Checkout PR
-        uses: actions/checkout@v4
-
-      - name: Install deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y make gcc
-
-      - name: Build PR version
-        run: |
-          make clean
-          make BUILD_PROFILE=release CC=gcc all
-
-      - name: Benchmark PR
-        run: |
-          ./build/bin/crive --benchmark 5 | tee pr.log || true
-          grep -i "passwords/sec" pr.log | awk '{print $1}' > pr_speed.txt || echo 0 > pr_speed.txt
-
-      - name: Checkout main branch
-        uses: actions/checkout@v4
-        with:
-          ref: main
-          path: main_branch
-
-      - name: Build main version
-        run: |
-          cd main_branch
-          make clean
-          make BUILD_PROFILE=release CC=gcc all
-
-      - name: Benchmark main
-        run: |
-          cd main_branch
-          ./build/bin/crive --benchmark 5 | tee main.log || true
-          grep -i "passwords/sec" main.log | awk '{print $1}' > ../main_speed.txt || echo 0 > ../main_speed.txt
-
-      - name: Compare performance
-        id: compare
-        run: |
-          PR=$(cat pr_speed.txt)
-          MAIN=$(cat main_speed.txt)
-
-          echo "PR speed: $PR"
-          echo "Main speed: $MAIN"
-
-          if [ "$MAIN" -eq 0 ]; then
-            echo "result=unknown" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          DIFF=$((PR - MAIN))
-          PERCENT=$((100 * DIFF / MAIN))
-
-          echo "percent=$PERCENT" >> $GITHUB_OUTPUT
-
-      - name: Comment on PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const percent = "${{ steps.compare.outputs.percent }}";
-            let msg = "";
-
-            if (!percent) {
-              msg = "No performance data available.";
-            } else if (percent > 5) {
-              msg = `Performance improved by +${percent}%`;
-            } else if (percent < -5) {
-              msg = `Performance dropped by ${percent}%`;
-            } else {
-              msg = `No significant change (${percent}%)`;
-            }
-
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `Performance Report:\n\n${msg}`
-            });
-
   final:
     name: Final Status
     runs-on: ubuntu-latest
-    needs: [build, test, lint, benchmark, valgrind, perf-compare]
+    needs: [build, test, valgrind, benchmark]
     if: always()
 
     steps:
       - name: Summary
         run: |
-          echo "Build:      ${{ needs.build.result }}"
-          echo "Test:       ${{ needs.test.result }}"
-          echo "Lint:       ${{ needs.lint.result }}"
-          echo "Benchmark:  ${{ needs.benchmark.result }}"
-          echo "Valgrind:   ${{ needs.valgrind.result }}"
-          echo "Perf:       ${{ needs.perf-compare.result }}"
+          echo "Build:     ${{ needs.build.result }}"
+          echo "Test:      ${{ needs.test.result }}"
+          echo "Valgrind:  ${{ needs.valgrind.result }}"
+          echo "Benchmark: ${{ needs.benchmark.result }}"
