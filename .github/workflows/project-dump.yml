@@ -1,0 +1,161 @@
+name: Project Dump Generator
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+# Required for committing dump back to repo
+permissions:
+  contents: write
+
+jobs:
+  dump-project:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🔍 Environment Info
+        run: |
+          echo "---- SYSTEM INFORMATION ----"
+          echo "Runner OS: $RUNNER_OS"
+          echo "Working Directory: $(pwd)"
+          echo "Git Version: $(git --version)"
+          echo "Date: $(date)"
+          echo "-----------------------------"
+
+      - name: 🧹 Remove Old Dump
+        run: |
+          echo "[INFO] Checking for existing dump file..."
+
+          if [ -f project_dump.txt ]; then
+            echo "[WARNING] Old project_dump.txt detected"
+            echo "[ACTION] Removing previous dump"
+            rm -f project_dump.txt
+
+            if [ -f project_dump.txt ]; then
+              echo "[ERROR] Failed to delete old dump!"
+              exit 1
+            else
+              echo "[SUCCESS] Old dump removed"
+            fi
+          else
+            echo "[INFO] No previous dump found"
+          fi
+
+      - name: 📦 Generate Project Dump
+        run: |
+          set -e
+
+          OUTPUT_FILE="project_dump.txt"
+
+          echo "[INFO] Starting dump generation..."
+
+          echo "==============================" >> $OUTPUT_FILE
+          echo "PROJECT STRUCTURE & CONTENT" >> $OUTPUT_FILE
+          echo "Generated: $(date)" >> $OUTPUT_FILE
+          echo "==============================" >> $OUTPUT_FILE
+          echo "" >> $OUTPUT_FILE
+
+          echo "[INFO] Writing file tree..."
+
+          echo "FILE TREE:" >> $OUTPUT_FILE
+          echo "------------------------------" >> $OUTPUT_FILE
+
+          # Exclude ONLY .git directory
+          find . \
+            -not -path "./.git" \
+            -not -path "./.git/*" \
+            | sed 's|^\./||' >> $OUTPUT_FILE
+
+          echo "" >> $OUTPUT_FILE
+          echo "FILE CONTENTS:" >> $OUTPUT_FILE
+          echo "------------------------------" >> $OUTPUT_FILE
+
+          echo "[INFO] Dumping file contents..."
+
+          FILE_COUNT=0
+          ERROR_COUNT=0
+
+          find . -type f \
+            -not -path "./.git/*" \
+            -not -name "project_dump.txt" \
+            | while read file; do
+
+              FILE_COUNT=$((FILE_COUNT+1))
+
+              echo "[INFO] Processing file: $file"
+
+              echo "" >> $OUTPUT_FILE
+              echo "========================================" >> $OUTPUT_FILE
+              echo "FILE: $file" >> $OUTPUT_FILE
+              echo "========================================" >> $OUTPUT_FILE
+              echo "" >> $OUTPUT_FILE
+
+              if cat "$file" >> $OUTPUT_FILE; then
+                echo "[SUCCESS] Added $file"
+              else
+                echo "[WARNING] Could not read $file"
+                echo "[Cannot read file]" >> $OUTPUT_FILE
+                ERROR_COUNT=$((ERROR_COUNT+1))
+              fi
+          done
+
+          echo "" >> $OUTPUT_FILE
+          echo "----------------------------------------" >> $OUTPUT_FILE
+          echo "Dump Completed: $(date)" >> $OUTPUT_FILE
+          echo "----------------------------------------" >> $OUTPUT_FILE
+
+          echo "[INFO] Dump generation finished"
+
+      - name: 📊 Dump Statistics
+        run: |
+          echo "[INFO] Calculating dump statistics..."
+
+          if [ ! -f project_dump.txt ]; then
+            echo "[ERROR] Dump file missing!"
+            exit 1
+          fi
+
+          SIZE=$(du -h project_dump.txt | cut -f1)
+          LINES=$(wc -l < project_dump.txt)
+
+          echo "Dump Size: $SIZE"
+          echo "Total Lines: $LINES"
+
+          echo "[SUCCESS] Dump statistics generated"
+
+      - name: 📤 Upload Dump Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: project-dump
+          path: project_dump.txt
+
+      - name: 📝 Commit Dump to Repository
+        run: |
+          echo "[INFO] Preparing to commit dump..."
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add project_dump.txt
+
+          if git diff --cached --quiet; then
+            echo "[INFO] No changes detected. Skipping commit."
+          else
+            echo "[INFO] Changes detected. Creating commit..."
+            git commit -m "chore: regenerate project dump"
+            git push
+            echo "[SUCCESS] Dump committed and pushed"
+          fi
+
+      - name: ✅ Workflow Completed
+        run: |
+          echo "----------------------------------"
+          echo "Project Dump Workflow Completed"
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Run ID: $GITHUB_RUN_ID"
+          echo "----------------------------------"
