@@ -247,16 +247,7 @@ extern uint64_t attack_ctx_keyspace(const attack_ctx_t *ctx);
 extern uint64_t attack_ctx_get_dict_offset  (const attack_ctx_t *ctx);
 extern uint64_t attack_ctx_get_brute_index  (const attack_ctx_t *ctx);
 
-/* Declared in archive.c */
-typedef struct archive_ctx archive_ctx_t;
-extern int  archive_open           (archive_ctx_t *ctx, const char *path,
-                                     archive_type_t type);
-extern void archive_ctx_free       (archive_ctx_t *ctx);
-extern bool archive_validate_password(const archive_ctx_t *ctx,
-                                       const char *password);
-extern int  archive_ctx_clone      (archive_ctx_t *dst,
-                                     const archive_ctx_t *src);
-extern void archive_print_info     (const archive_ctx_t *ctx, bool no_color);
+#include "archive.h"
 
 /* From utils.c */
 extern void status_line_update     (const void *state, bool no_color);
