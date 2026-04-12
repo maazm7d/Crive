@@ -1492,28 +1492,24 @@ engine_run_result_t engine_run_chain(const config_t *base_cfg,
 }
 
 /* ============================================================
- * THREAD AFFINITY SETTER
+ * THREAD AFFINITY SETTER (FIXED FOR ANDROID)
  * ============================================================ */
 
-#ifdef __linux__
-#include <sched.h>
-
 static void engine_set_thread_affinity(pthread_t tid, int cpu_id) {
+#if defined(__linux__) && !defined(__ANDROID__)
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu_id % (int)sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
-
     int rc = pthread_setaffinity_np(tid, sizeof(cpuset), &cpuset);
     if (rc != 0) {
         log_debug("set_affinity: failed for cpu %d: %s",
                   cpu_id, strerror(rc));
     }
-}
 #else
-static void engine_set_thread_affinity(pthread_t tid, int cpu_id) {
-    (void)tid; (void)cpu_id;
-}
+    (void)tid;
+    (void)cpu_id;
 #endif
+}
 
 /* ============================================================
  * ENGINE WITH AFFINITY
