@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 17:04:15 UTC 2026
+Generated: Sun Apr 12 17:36:54 UTC 2026
 ==============================
 
 FILE TREE:
@@ -4629,7 +4629,7 @@ FILE: ./utils.c
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <locale.h>
-#include <stddef.h> 
+#include <stddef.h>
 
 /* ============================================================
  * VERSION AND BUILD INFO
@@ -4928,7 +4928,7 @@ typedef enum {
     RULE_MAX
 } rule_type_t;
 
-static const char *rule_type_names[] = {
+static const char *rule_type_names[] __attribute__((unused)) = {
     [RULE_APPEND_DIGIT]     = "append_digit",
     [RULE_PREPEND_DIGIT]    = "prepend_digit",
     [RULE_UPPERCASE_ALL]    = "uppercase_all",
@@ -5122,7 +5122,7 @@ static bool          g_log_no_color   = false;
 static bool          g_log_quiet      = false;
 static pthread_mutex_t g_log_mutex    = PTHREAD_MUTEX_INITIALIZER;
 static bool          g_log_timestamp  = true;
-static bool          g_log_thread_id  = false;
+static bool          g_log_thread_id __attribute__((unused)) = false;
 static char          g_log_prefix[64] = "";
 
 void log_init(const char *log_file_path, log_level_t level, bool no_color, bool quiet) {
@@ -5253,52 +5253,52 @@ void log_message(log_level_t level, const char *fmt, ...) {
 #define log_error(fmt, ...)   log_message(LOG_ERROR,   fmt, ##__VA_ARGS__)
 
 /* ============================================================
- * TIMING UTILITIES
+ * TIMING UTILITIES (external linkage)
  * ============================================================ */
 
-FORCE_INLINE uint64_t timespec_to_ns(const struct timespec *ts) {
+uint64_t timespec_to_ns(const struct timespec *ts) {
     return (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
 }
 
-FORCE_INLINE uint64_t timespec_diff_ns(const struct timespec *start,
-                                        const struct timespec *end) {
+uint64_t timespec_diff_ns(const struct timespec *start,
+                          const struct timespec *end) {
     uint64_t s = timespec_to_ns(start);
     uint64_t e = timespec_to_ns(end);
     return (e >= s) ? (e - s) : 0ULL;
 }
 
-FORCE_INLINE double timespec_diff_ms(const struct timespec *start,
-                                      const struct timespec *end) {
+double timespec_diff_ms(const struct timespec *start,
+                        const struct timespec *end) {
     return (double)timespec_diff_ns(start, end) / 1e6;
 }
 
-FORCE_INLINE double timespec_diff_sec(const struct timespec *start,
-                                       const struct timespec *end) {
+double timespec_diff_sec(const struct timespec *start,
+                         const struct timespec *end) {
     return (double)timespec_diff_ns(start, end) / 1e9;
 }
 
-FORCE_INLINE uint64_t get_time_ns(void) {
+uint64_t get_time_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return timespec_to_ns(&ts);
 }
 
-FORCE_INLINE uint64_t get_time_ms(void) {
+uint64_t get_time_ms(void) {
     return get_time_ns() / 1000000ULL;
 }
 
-FORCE_INLINE struct timespec get_timespec_now(void) {
+struct timespec get_timespec_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts;
 }
 
-FORCE_INLINE double elapsed_seconds_since(const struct timespec *start) {
+double elapsed_seconds_since(const struct timespec *start) {
     struct timespec now = get_timespec_now();
     return timespec_diff_sec(start, &now);
 }
 
-FORCE_INLINE uint64_t elapsed_ms_since(const struct timespec *start) {
+uint64_t elapsed_ms_since(const struct timespec *start) {
     struct timespec now = get_timespec_now();
     return (uint64_t)timespec_diff_ms(start, &now);
 }
@@ -7237,8 +7237,8 @@ void benchmark_print(const benchmark_result_t *res, bool no_color) {
  * MISCELLANEOUS UTILITIES
  * ============================================================ */
 
-/* CRC32 table - used by ZIP validation */
-static uint32_t g_crc32_table[256];
+/* CRC32 table - used by ZIP validation, must be visible to archive.c */
+uint32_t g_crc32_table[256];
 static bool     g_crc32_initialized = false;
 
 void crc32_init(void) {
@@ -12410,5 +12410,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 17:04:15 UTC 2026
+Dump Completed: Sun Apr 12 17:36:54 UTC 2026
 ----------------------------------------
