@@ -829,7 +829,7 @@ FORCE_INLINE void zip_update_keys(zip_keys_t *keys, uint8_t c) {
 
 FORCE_INLINE uint8_t zip_decrypt_byte(const zip_keys_t *keys) {
     uint16_t t = (uint16_t)(keys->k2 | 2);
-    return (uint8_t)((t * (t ^ 1)) >> 8);
+    return (uint8_t)(((uint32_t)t * (uint32_t)(t ^ 1U)) >> 8);
 }
 
 FORCE_INLINE uint8_t zip_decrypt_char(zip_keys_t *keys, uint8_t c) {
