@@ -121,6 +121,11 @@ CWARN           := -Wall \
 # Clang-specific warnings (replaced block)
 ifeq ($(CC_IS_CLANG),1)
   CWARN         += -Weverything \
+                   -Wno-unsafe-buffer-usage \
+                   -Wno-error=unsafe-buffer-usage \
+                   -Wno-cast-align \
+                   -Wno-sign-conversion \
+                   -Wno-unused-macros \
                    -Wno-padded \
                    -Wno-covered-switch-default \
                    -Wno-disabled-macro-expansion \
