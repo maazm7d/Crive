@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 16:51:46 UTC 2026
+Generated: Sun Apr 12 17:04:15 UTC 2026
 ==============================
 
 FILE TREE:
@@ -8384,11 +8384,11 @@ FILE: ./main.c
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <locale.h>
-#include "archive.h"
+
+#include "archive.h"   /* Provides archive_type_t, archive_ctx_t, etc. */
 
 /* ============================================================
- * ALL TYPES REDECLARED HERE FOR STANDALONE COMPILATION
- * In a real build, these come from a shared header.
+ * VERSION AND PLATFORM (duplicated from utils.c, but needed here)
  * ============================================================ */
 
 #define CRIVE_VERSION_STR       "1.0.0"
@@ -8470,7 +8470,7 @@ FILE: ./main.c
 #define CHARSET_PRINTABLE    " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
 /* ============================================================
- * ENUMS AND STRUCTS
+ * ENUMS AND STRUCTS (only those not provided by archive.h or utils.h)
  * ============================================================ */
 
 typedef enum {
@@ -8491,13 +8491,6 @@ typedef enum {
     ATTACK_BENCHMARK    = 6,
     ATTACK_MAX
 } attack_mode_t;
-
-typedef enum {
-    ARCHIVE_UNKNOWN = 0,
-    ARCHIVE_ZIP     = 1,
-    ARCHIVE_7Z      = 2,
-    ARCHIVE_MAX
-} archive_type_t;
 
 typedef enum {
     ATTACK_RESULT_NOT_FOUND = 0,
@@ -8638,9 +8631,8 @@ typedef struct {
     bool                is_benchmark;
 } engine_run_result_t;
 
-
 /* ============================================================
- * EXTERNAL FUNCTION DECLARATIONS
+ * EXTERNAL FUNCTION DECLARATIONS (from utils.c, archive.c, engine.c)
  * ============================================================ */
 
 /* utils.c */
@@ -8700,25 +8692,7 @@ extern int      resume_save          (const char *path,
 extern int      resume_load          (const char *path, resume_state_t *rs);
 extern void     resume_print         (const resume_state_t *rs, bool no_color);
 
-/* archive.c */
-extern int      archive_open         (archive_ctx_t *ctx, const char *path,
-                                      archive_type_t type);
-extern void     archive_ctx_free     (archive_ctx_t *ctx);
-extern bool     archive_validate_password(const archive_ctx_t *ctx,
-                                           const char *password);
-extern int      archive_ctx_clone    (archive_ctx_t *dst,
-                                      const archive_ctx_t *src);
-extern void     archive_print_info   (const archive_ctx_t *ctx, bool no_color);
-extern archive_type_t detect_archive_type(const char *path);
-
-typedef struct {
-    archive_type_t type;
-    double         validations_per_sec;
-    double         ns_per_validation;
-} archive_bench_t;
-
-extern archive_bench_t archive_benchmark(archive_type_t type, int duration_ms);
-
+/* archive.c – functions are declared in archive.h, no need to repeat */
 /* engine.c */
 extern engine_run_result_t engine_orchestrate(const config_t *cfg,
                                                archive_ctx_t *archive);
@@ -8813,7 +8787,8 @@ static void config_set_defaults(config_t *cfg) {
  * ============================================================ */
 
 static void print_usage(const char *prog) {
-    bool nc = g_no_color;
+    /* nc variable not used – silence warning with (void) */
+    (void)g_no_color;
 
     safe_eprint(
         "%s%sCRIVE%s - Archive Password Recovery Framework v%s\n"
@@ -9730,7 +9705,8 @@ static void display_archive_info(archive_ctx_t *archive,
 static void display_wordlist_info(const config_t *cfg) {
     if (cfg->wordlist_path[0] == '\0') return;
 
-    bool nc = cfg->no_color;
+    /* 'nc' variable is not used – silence warning */
+    (void)cfg->no_color;
 
     safe_eprint("  %s%-20s%s %s%s%s\n",
                 cc(CLR_LABEL), "Wordlist:", cc(ANSI_RESET),
@@ -12434,5 +12410,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 16:51:47 UTC 2026
+Dump Completed: Sun Apr 12 17:04:15 UTC 2026
 ----------------------------------------
