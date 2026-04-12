@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 10:08:59 UTC 2026
+Generated: Sun Apr 12 10:32:03 UTC 2026
 ==============================
 
 FILE TREE:
@@ -7317,9 +7317,15 @@ CWARN           := -Wall \
                    -Wundef \
                    -Wpointer-arith \
                    -Wcast-align \
-                   -Wwrite-strings
+                   -Wwrite-strings \
+                   -Wno-missing-prototypes \
+                   -Wno-strict-prototypes \
+                   -Wno-date-time \
+                   -Wno-unused-macros \
+                   -Wno-sign-conversion \
+                   -Wno-bad-function-cast
 
-# Clang-specific warnings
+# Clang-specific warnings (replaced block)
 ifeq ($(CC_IS_CLANG),1)
   CWARN         += -Weverything \
                    -Wno-padded \
@@ -12378,5 +12384,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 10:08:59 UTC 2026
+Dump Completed: Sun Apr 12 10:32:03 UTC 2026
 ----------------------------------------
