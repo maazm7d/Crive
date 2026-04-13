@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Mon Apr 13 09:17:37 UTC 2026
+Generated: Mon Apr 13 09:19:11 UTC 2026
 ==============================
 
 FILE TREE:
@@ -421,6 +421,8 @@ typedef struct zip_ctx {
     size_t           data_size;
     bool             mmap_used;
     int              fd;
+
+    char             archive_path[MAX_PATH_LEN];   /* archive path for CLI verification */
 
     uint32_t         crc32;
     uint16_t         flags;
@@ -12511,5 +12513,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Mon Apr 13 09:17:37 UTC 2026
+Dump Completed: Mon Apr 13 09:19:11 UTC 2026
 ----------------------------------------
