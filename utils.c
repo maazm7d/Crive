@@ -1732,19 +1732,31 @@ int mask_parse(mask_spec_t *ms, const char *mask_str,
                const charset_spec_t *custom_charsets,
                int num_custom) {
     memset(ms, 0, sizeof(*ms));
+    
+    /* If mask_str is empty but ms->raw_mask is already set, use it (workaround) */
+    if ((!mask_str || mask_str[0] == '\0') && ms->raw_mask[0] != '\0') {
+        mask_str = ms->raw_mask;
+        log_debug("mask_parse: using ms->raw_mask = '%s'", mask_str);
+    }
+    
+    if (!mask_str || mask_str[0] == '\0') {
+        log_error("mask_parse: mask string is empty");
+        return -1;
+    }
+    
     str_copy(ms->raw_mask, sizeof(ms->raw_mask), mask_str);
     log_debug("mask_parse: raw_mask = '%s'", ms->raw_mask);
-
+    
     const char *p   = mask_str;
     int         pos = 0;
-
+    
     while (*p && pos < MAX_MASK_POSITIONS) {
         mask_position_t *mp = &ms->positions[pos];
-
+        
         if (*p == '?' && *(p+1)) {
             char code = *(p+1);
             p += 2;
-
+            
             switch (code) {
                 case 'l':
                     str_copy(mp->charset, sizeof(mp->charset), CHARSET_LOWER);
@@ -1807,19 +1819,19 @@ int mask_parse(mask_spec_t *ms, const char *mask_str,
             mp->charset_len = 1;
             p++;
         }
-
+        
         if (mp->charset_len > 0) {
             pos++;
         }
     }
-
+    
     ms->num_positions = pos;
-
+    
     if (pos == 0) {
         log_error("mask_parse: no positions parsed from mask '%s'", mask_str);
         return -1;
     }
-
+    
     return 0;
 }
 
