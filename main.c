@@ -628,10 +628,16 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
                 break;
 
             case 'm':
-                cfg->attack_mode = ATTACK_MASK;
-                snprintf(cfg->mask.raw_mask, sizeof(cfg->mask.raw_mask),
-                         "%s", optarg);
-                break;
+    cfg->attack_mode = ATTACK_MASK;
+    if (!optarg || optarg[0] == '\0') {
+        safe_eprint("%s Mask argument is empty.\n", SYM_ERR);
+        safe_eprint("   Please provide a mask pattern and quote it:\n");
+        safe_eprint("       crive %s --mask '?l?l?d?d'\n", cfg->archive_path);
+        return -1;
+    }
+    snprintf(cfg->mask.raw_mask, sizeof(cfg->mask.raw_mask),
+             "%s", optarg);
+    break;
 
             case 'H':
                 cfg->attack_mode = ATTACK_HYBRID;
