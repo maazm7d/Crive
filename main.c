@@ -1444,6 +1444,32 @@ static int run_cracking_session(config_t *cfg) {
         display_wordlist_info(cfg);
     }
 
+  /* ----- 7z dependency check ----- */
+bool need_7z = false;
+if (cfg->archive_type == ARCHIVE_7Z) {
+    need_7z = true;
+} else if (cfg->archive_type == ARCHIVE_ZIP) {
+    /* For ZIP, we need 7z only if the compression method is not STORED (0) */
+    const struct zip_ctx *z = &archive->zip;
+    if (z->method != 0) {   /* 0 = stored (no compression) */
+        need_7z = true;
+    }
+}
+
+if (need_7z && !command_exists("7z")) {
+    safe_eprint("\n%s 7z (p7zip) is required to verify passwords for this archive.\n"
+                "   Please install p7zip:\n"
+                "     Termux : pkg install p7zip\n"
+                "     Debian : apt install p7zip-full\n"
+                "     Arch   : pacman -S p7zip\n"
+                "     macOS  : brew install p7zip\n\n",
+                SYM_ERR);
+    archive_ctx_free(archive);
+    free(archive);
+    return EXIT_FAILURE;
+}
+/* ----- end dependency check ----- */
+
     /* Display config summary */
     display_config_summary(cfg);
 
