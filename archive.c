@@ -1631,7 +1631,6 @@ static int sz_read_number(sz_reader_t *r, uint64_t *out) {
 static int sz_read_number_unused_wrapper(sz_reader_t *r, uint64_t *out) {
     return sz_read_number(r, out);
 }
-(void)sz_read_number_unused_wrapper;
 
 static bool sz_parse_aes_props(const uint8_t *props, size_t props_len,
                                 struct sz_ctx *ctx) {
