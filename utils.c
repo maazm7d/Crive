@@ -1731,24 +1731,31 @@ void charset_print(const charset_spec_t *cs, bool no_color) {
 int mask_parse(mask_spec_t *ms, const char *mask_str,
                const charset_spec_t *custom_charsets,
                int num_custom) {
-    memset(ms, 0, sizeof(*ms));
+    if (!ms) return -1;
     
-    /* If mask_str is empty but ms->raw_mask is already set, use it (workaround) */
-    if ((!mask_str || mask_str[0] == '\0') && ms->raw_mask[0] != '\0') {
-        mask_str = ms->raw_mask;
-        log_debug("mask_parse: using ms->raw_mask = '%s'", mask_str);
+    /* Clear only the positions, NOT the raw_mask (keep it if already set) */
+    memset(ms->positions, 0, sizeof(ms->positions));
+    ms->num_positions = 0;
+    
+    const char *input = mask_str;
+    
+    /* If the input is empty but ms->raw_mask already contains a value, use that */
+    if ((!input || input[0] == '\0') && ms->raw_mask[0] != '\0') {
+        input = ms->raw_mask;
+        log_debug("mask_parse: using ms->raw_mask = '%s'", input);
     }
     
-    if (!mask_str || mask_str[0] == '\0') {
+    if (!input || input[0] == '\0') {
         log_error("mask_parse: mask string is empty");
         return -1;
     }
     
-    str_copy(ms->raw_mask, sizeof(ms->raw_mask), mask_str);
+    /* Store the final mask string back into raw_mask (overwrite) */
+    str_copy(ms->raw_mask, sizeof(ms->raw_mask), input);
     log_debug("mask_parse: raw_mask = '%s'", ms->raw_mask);
     
-    const char *p   = mask_str;
-    int         pos = 0;
+    const char *p = input;
+    int pos = 0;
     
     while (*p && pos < MAX_MASK_POSITIONS) {
         mask_position_t *mp = &ms->positions[pos];
@@ -1828,7 +1835,7 @@ int mask_parse(mask_spec_t *ms, const char *mask_str,
     ms->num_positions = pos;
     
     if (pos == 0) {
-        log_error("mask_parse: no positions parsed from mask '%s'", mask_str);
+        log_error("mask_parse: no positions parsed from mask '%s'", input);
         return -1;
     }
     
