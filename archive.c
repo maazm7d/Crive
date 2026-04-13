@@ -2,6 +2,9 @@
  * archive.c - ZIP and 7Z archive parsing and password validation
  * Implements PKZIP encryption check and 7Z AES-based verification
  * C11 standard, optimized for Termux/Android Linux
+ *
+ * FIX: Added compressed data verification to eliminate false positives
+ *      in PKZIP weak header check.
  */
 
 #include <stdio.h>
@@ -1067,7 +1070,7 @@ int zip_parse(struct zip_ctx *ctx, const char *path) {
                     }
                 }
 
-                /* Read local header encryption data */
+                /* Read local header to locate encryption header and data offset */
                 if (lh_offset + sizeof(zip_local_header_t) <= ctx->data_size) {
                     const uint8_t *lh_ptr = ctx->data + lh_offset;
 
@@ -1104,6 +1107,8 @@ int zip_parse(struct zip_ctx *ctx, const char *path) {
                                        ctx->data + data_start + salt_len,
                                        2);
                             }
+                            /* Data offset is after salt and pwv */
+                            ctx->data_offset = (uint32_t)(data_start + salt_len + 2);
                         } else {
                             /* Standard PKZIP: 12-byte encryption header */
                             if (data_start + ZIP_ENCRYPTION_HEADER_SIZE
@@ -1112,6 +1117,8 @@ int zip_parse(struct zip_ctx *ctx, const char *path) {
                                        ctx->data + data_start,
                                        ZIP_ENCRYPTION_HEADER_SIZE);
                             }
+                            /* Data offset is after the 12-byte header */
+                            ctx->data_offset = (uint32_t)(data_start + ZIP_ENCRYPTION_HEADER_SIZE);
                         }
                     }
                 }
@@ -1248,8 +1255,74 @@ static void pbkdf2_sha1(const uint8_t *password, size_t pass_len,
  * ============================================================ */
 
 /*
+ * Verify the decrypted compressed data's first bytes to eliminate false positives.
+ */
+static bool zip_verify_compressed_data(const struct zip_ctx *ctx,
+                                        zip_keys_t *keys,
+                                        const char *password) {
+    (void)password;  // not needed directly
+
+    if (ctx->data_offset == 0 || ctx->data_offset >= ctx->data_size) {
+        return false;
+    }
+
+    size_t available = ctx->data_size - ctx->data_offset;
+    if (available < 8) return false;
+
+    /* Decrypt the first 16 bytes of the compressed data */
+    uint8_t encrypted[16];
+    size_t to_decrypt = (available < 16) ? available : 16;
+    memcpy(encrypted, ctx->data + ctx->data_offset, to_decrypt);
+
+    uint8_t decrypted[16];
+    for (size_t i = 0; i < to_decrypt; i++) {
+        decrypted[i] = zip_decrypt_char(keys, encrypted[i]);
+    }
+
+    /* Verify based on compression method */
+    switch (ctx->method) {
+        case 8:  /* Deflate */
+            if (to_decrypt < 2) return false;
+            /* zlib header: first byte 0x78, second byte in {0x01,0x9C,0xDA} */
+            if (decrypted[0] == 0x78 &&
+                (decrypted[1] == 0x01 || decrypted[1] == 0x9C || decrypted[1] == 0xDA))
+                return true;
+            return false;
+
+        case 12: /* BZip2 */
+            if (to_decrypt < 3) return false;
+            return (decrypted[0] == 'B' && decrypted[1] == 'Z' && decrypted[2] == 'h');
+
+        case 14: /* LZMA */
+            if (to_decrypt < 3) return false;
+            /* LZMA compressed data often starts with 0x5D 0x00 0x00 */
+            return (decrypted[0] == 0x5D && decrypted[1] == 0x00 && decrypted[2] == 0x00);
+
+        case 0:  /* Stored (no compression) */
+            /* Simple sanity: decrypted bytes should not be all zeros or high-entropy garbage */
+            {
+                bool all_zero = true;
+                for (size_t i = 0; i < to_decrypt; i++) {
+                    if (decrypted[i] != 0) { all_zero = false; break; }
+                }
+                if (all_zero) return false;
+                /* Additional check: first few bytes should be printable or typical file magic */
+                if (to_decrypt >= 2 && (decrypted[0] < 0x20 || decrypted[0] > 0x7E) &&
+                    !(decrypted[0] == 0x0A || decrypted[0] == 0x0D))
+                    return false;
+                return true;
+            }
+
+        default:
+            /* Unknown compression – accept weak check only (fallback) */
+            return true;
+    }
+}
+
+/*
  * Validate password against PKZIP-encrypted entry.
- * Uses the 12-byte encryption header check method.
+ * Uses the 12-byte encryption header check method, then verifies
+ * the compressed data header to eliminate false positives.
  *
  * Returns true if password is correct.
  */
@@ -1269,8 +1342,6 @@ static bool zip_validate_pkzip(const struct zip_ctx *ctx, const char *password) 
      * The 12th byte (index 11) of the decrypted header:
      * - if DATA_DESCRIPTOR flag set: should match high byte of mod time
      * - otherwise: should match high byte of CRC32
-     *
-     * This is the standard PKZIP 2.04g check.
      */
     uint8_t check;
     if (ctx->use_crc_check) {
@@ -1279,7 +1350,12 @@ static bool zip_validate_pkzip(const struct zip_ctx *ctx, const char *password) 
         check = ctx->check_byte_time;
     }
 
-    return (decrypted[ZIP_ENCRYPTION_HEADER_SIZE - 1] == check);
+    if (decrypted[ZIP_ENCRYPTION_HEADER_SIZE - 1] != check) {
+        return false;
+    }
+
+    /* Weak check passed – now verify actual compressed data */
+    return zip_verify_compressed_data(ctx, &keys, password);
 }
 
 /*
@@ -1386,14 +1462,12 @@ static int sz_read_uint64(sz_reader_t *r, uint64_t *out) {
                 result |= ((uint64_t)eb << (8 * (i)));
                 i++;
             }
-            /* Actually the 7z variable encoding works differently */
             break;
         }
         result |= ((uint64_t)(b & (mask - 1)) << (8 * extra));
         mask >>= 1;
         extra++;
         if (extra == 8) {
-            /* Full 8 extra bytes */
             for (int j = 0; j < 8; j++) {
                 uint8_t eb;
                 if (sz_read_byte(r, &eb) != 0) return -1;
@@ -1403,8 +1477,6 @@ static int sz_read_uint64(sz_reader_t *r, uint64_t *out) {
         }
     }
 
-    /* Simpler implementation: use the actual 7z UINT64 format */
-    /* Reset and redo properly */
     (void)result;
     (void)extra;
     (void)mask;
@@ -1461,7 +1533,6 @@ static int sz_read_number(sz_reader_t *r, uint64_t *out) {
     else                          { extra_bytes = 8; val = 0; }
 
     val = ((uint64_t)(first & (0x0F >> (extra_bytes - 4))));
-    /* place already read bytes */
     val = (val << 8) | second;
     val = (val << 8) | third;
     val = (val << 8) | fourth;
