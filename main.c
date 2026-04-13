@@ -334,7 +334,7 @@ extern int      resume_save          (const char *path,
                                       const resume_state_t *rs);
 extern int      resume_load          (const char *path, resume_state_t *rs);
 extern void     resume_print         (const resume_state_t *rs, bool no_color);
-extern bool     command_exists.      (const char *cmd);
+extern bool     command_exists       (const char *cmd);
 
 /* archive.c – functions are declared in archive.h, no need to repeat */
 /* engine.c */
