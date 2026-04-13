@@ -1559,6 +1559,29 @@ int64_t file_count_lines(const char *path) {
     return lines;
 }
 
+bool command_exists(const char *cmd) {
+    if (!cmd || !*cmd) return false;
+
+    char *path_env = getenv("PATH");
+    if (!path_env) return false;
+
+    /* Make a modifiable copy of PATH */
+    char path_copy[4096];
+    snprintf(path_copy, sizeof(path_copy), "%s", path_env);
+
+    char *saveptr;
+    char *dir = strtok_r(path_copy, ":", &saveptr);
+    while (dir) {
+        char fullpath[4096];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, cmd);
+        if (access(fullpath, X_OK) == 0) {
+            return true;
+        }
+        dir = strtok_r(NULL, ":", &saveptr);
+    }
+    return false;
+}
+
 /* ============================================================
  * CHARSET PARSING
  * ============================================================ */
