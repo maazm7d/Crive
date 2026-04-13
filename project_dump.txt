@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Mon Apr 13 09:55:08 UTC 2026
+Generated: Mon Apr 13 10:02:25 UTC 2026
 ==============================
 
 FILE TREE:
@@ -8915,7 +8915,7 @@ extern int      resume_save          (const char *path,
                                       const resume_state_t *rs);
 extern int      resume_load          (const char *path, resume_state_t *rs);
 extern void     resume_print         (const resume_state_t *rs, bool no_color);
-extern bool     command_exists.      (const char *cmd);
+extern bool     command_exists       (const char *cmd);
 
 /* archive.c – functions are declared in archive.h, no need to repeat */
 /* engine.c */
@@ -12563,5 +12563,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Mon Apr 13 09:55:08 UTC 2026
+Dump Completed: Mon Apr 13 10:02:25 UTC 2026
 ----------------------------------------
