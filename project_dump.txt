@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Mon Apr 13 10:02:25 UTC 2026
+Generated: Mon Apr 13 10:17:24 UTC 2026
 ==============================
 
 FILE TREE:
@@ -9209,10 +9209,16 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
                 break;
 
             case 'm':
-                cfg->attack_mode = ATTACK_MASK;
-                snprintf(cfg->mask.raw_mask, sizeof(cfg->mask.raw_mask),
-                         "%s", optarg);
-                break;
+    cfg->attack_mode = ATTACK_MASK;
+    if (!optarg || optarg[0] == '\0') {
+        safe_eprint("%s Mask argument is empty.\n", SYM_ERR);
+        safe_eprint("   Please provide a mask pattern and quote it:\n");
+        safe_eprint("       crive %s --mask '?l?l?d?d'\n", cfg->archive_path);
+        return -1;
+    }
+    snprintf(cfg->mask.raw_mask, sizeof(cfg->mask.raw_mask),
+             "%s", optarg);
+    break;
 
             case 'H':
                 cfg->attack_mode = ATTACK_HYBRID;
@@ -12563,5 +12569,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Mon Apr 13 10:02:25 UTC 2026
+Dump Completed: Mon Apr 13 10:17:24 UTC 2026
 ----------------------------------------
