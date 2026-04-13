@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Sun Apr 12 20:24:14 UTC 2026
+Generated: Mon Apr 13 04:22:57 UTC 2026
 ==============================
 
 FILE TREE:
@@ -444,6 +444,7 @@ typedef struct zip_ctx {
     int              num_files;
     char             filename[256];
     bool             has_encrypted_file;
+    uint32_t         data_offset;             /* offset of encrypted data (after header) */
 } zip_ctx_t;
 
 /* -------------------------------------------------------------------------
@@ -12662,5 +12663,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Sun Apr 12 20:24:14 UTC 2026
+Dump Completed: Mon Apr 13 04:22:57 UTC 2026
 ----------------------------------------
