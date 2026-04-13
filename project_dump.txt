@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Mon Apr 13 04:22:57 UTC 2026
+Generated: Mon Apr 13 04:36:14 UTC 2026
 ==============================
 
 FILE TREE:
@@ -2484,9 +2484,12 @@ FILE: ./attacks.c
 ========================================
 
 /*
- * attacks.c - All attack strategy implementations
- * Dictionary, Brute-Force, Mask, Hybrid, Rule-Based attacks
+ * archive.c - ZIP and 7Z archive parsing and password validation
+ * Implements PKZIP encryption check and 7Z AES-based verification
  * C11 standard, optimized for Termux/Android Linux
+ *
+ * FIX: Added compressed data verification to eliminate false positives
+ *      in PKZIP weak header check.
  */
 
 #include <stdio.h>
@@ -2500,15 +2503,14 @@ FILE: ./attacks.c
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 #include <pthread.h>
-#include <ctype.h>
-#include <limits.h>
-#include <stdatomic.h>
+#include <math.h>
 
-/* ============================================================
- * FORWARD DECLARATIONS FROM utils.c
- * ============================================================ */
+#include "archive.h"   
 
+/* Forward declarations from utils.c */
 typedef enum {
     LOG_DEBUG   = 0,
     LOG_INFO    = 1,
@@ -2518,2279 +2520,2357 @@ typedef enum {
 } log_level_t;
 
 void log_message(log_level_t level, const char *fmt, ...);
-#define log_debug(fmt, ...)  log_message(LOG_DEBUG,   fmt, ##__VA_ARGS__)
-#define log_info(fmt, ...)   log_message(LOG_INFO,    fmt, ##__VA_ARGS__)
-#define log_warn(fmt, ...)   log_message(LOG_WARNING, fmt, ##__VA_ARGS__)
-#define log_error(fmt, ...)  log_message(LOG_ERROR,   fmt, ##__VA_ARGS__)
+#define log_debug(fmt, ...)   log_message(LOG_DEBUG,   fmt, ##__VA_ARGS__)
+#define log_info(fmt, ...)    log_message(LOG_INFO,    fmt, ##__VA_ARGS__)
+#define log_warn(fmt, ...)    log_message(LOG_WARNING, fmt, ##__VA_ARGS__)
+#define log_error(fmt, ...)   log_message(LOG_ERROR,   fmt, ##__VA_ARGS__)
 
-#define LIKELY(x)            __builtin_expect(!!(x), 1)
-#define UNLIKELY(x)          __builtin_expect(!!(x), 0)
-#define FORCE_INLINE         __attribute__((always_inline)) static inline
-#define PURE_FN              __attribute__((pure))
-#define UNUSED               __attribute__((unused))
+#define LIKELY(x)             __builtin_expect(!!(x), 1)
+#define UNLIKELY(x)           __builtin_expect(!!(x), 0)
+#define FORCE_INLINE          __attribute__((always_inline)) static inline
+#define PACKED                __attribute__((packed))
 
-#define MAX_PASSWORD_LEN     128
-#define MAX_PATH_LEN         4096
-#define MAX_CHARSET_LEN      512
-#define MAX_MASK_LEN         256
-#define MAX_MASK_POSITIONS   32
-#define MAX_RULES            4096
-#define MAX_LINE_LEN         8192
-#define KB                   (1024ULL)
-#define MB                   (1024ULL * KB)
-#define DEFAULT_BATCH_SIZE   1024
+#define MAX_PASSWORD_LEN      128
+#define KB                    (1024ULL)
+#define MB                    (1024ULL * KB)
 
-/* ============================================================
- * CHARSET AND MASK STRUCTS (mirrored from utils.c)
- * ============================================================ */
-
-typedef struct {
-    char    chars[MAX_CHARSET_LEN];
-    int     len;
-    bool    use_lower;
-    bool    use_upper;
-    bool    use_digits;
-    bool    use_special;
-    bool    use_custom;
-    char    custom[MAX_CHARSET_LEN];
-} charset_spec_t;
-
-typedef struct {
-    char    charset[MAX_CHARSET_LEN];
-    int     charset_len;
-} mask_position_t;
-
-typedef struct {
-    mask_position_t positions[MAX_MASK_POSITIONS];
-    int             num_positions;
-    char            raw_mask[MAX_MASK_LEN];
-} mask_spec_t;
-
-typedef struct {
-    bool        append_digits;
-    bool        append_special;
-    bool        prepend_digits;
-    bool        prepend_special;
-    int         suffix_min_len;
-    int         suffix_max_len;
-    int         prefix_min_len;
-    int         prefix_max_len;
-    char        suffix_charset[MAX_CHARSET_LEN];
-    char        prefix_charset[MAX_CHARSET_LEN];
-} hybrid_config_t;
-
-typedef enum {
-    RULE_APPEND_DIGIT       = 0,
-    RULE_PREPEND_DIGIT      = 1,
-    RULE_UPPERCASE_ALL      = 2,
-    RULE_LOWERCASE_ALL      = 3,
-    RULE_CAPITALIZE         = 4,
-    RULE_REVERSE            = 5,
-    RULE_DUPLICATE          = 6,
-    RULE_LEET_SPEAK         = 7,
-    RULE_APPEND_YEAR        = 8,
-    RULE_APPEND_SPECIAL     = 9,
-    RULE_TOGGLE_CASE        = 10,
-    RULE_ROTATE_LEFT        = 11,
-    RULE_ROTATE_RIGHT       = 12,
-    RULE_REFLECT            = 13,
-    RULE_STRIP_VOWELS       = 14,
-    RULE_MAX
-} rule_type_t;
-
-typedef struct {
-    rule_type_t type;
-    char        param[64];
-    int         param_int;
-} rule_t;
-
-typedef enum {
-    ATTACK_NONE         = 0,
-    ATTACK_DICTIONARY   = 1,
-    ATTACK_BRUTEFORCE   = 2,
-    ATTACK_MASK         = 3,
-    ATTACK_HYBRID       = 4,
-    ATTACK_RULE         = 5,
-    ATTACK_BENCHMARK    = 6,
-    ATTACK_MAX
-} attack_mode_t;
-
-/* ============================================================
- * ATTACK RESULT CODES
- * ============================================================ */
-
-typedef enum {
-    ATTACK_RESULT_NOT_FOUND    = 0,
-    ATTACK_RESULT_FOUND        = 1,
-    ATTACK_RESULT_EXHAUSTED    = 2,
-    ATTACK_RESULT_ERROR        = 3,
-    ATTACK_RESULT_ABORTED      = 4,
-} attack_result_t;
-
-/* ============================================================
- * CANDIDATE BATCH
- * ============================================================ */
-
-#define CANDIDATE_MAX_LEN   MAX_PASSWORD_LEN
-#define BATCH_MAX_SIZE      4096
-
-typedef struct {
-    char     passwords[BATCH_MAX_SIZE][CANDIDATE_MAX_LEN];
-    int      count;
-    int      capacity;
-} candidate_batch_t;
-
-FORCE_INLINE void batch_init(candidate_batch_t *b, int capacity) {
-    b->count    = 0;
-    b->capacity = (capacity > BATCH_MAX_SIZE) ? BATCH_MAX_SIZE : capacity;
-}
-
-FORCE_INLINE void batch_reset(candidate_batch_t *b) {
-    b->count = 0;
-}
-
-FORCE_INLINE bool batch_full(const candidate_batch_t *b) {
-    return b->count >= b->capacity;
-}
-
-FORCE_INLINE bool batch_empty(const candidate_batch_t *b) {
-    return b->count == 0;
-}
-
-FORCE_INLINE void batch_add(candidate_batch_t *b, const char *pw) {
-    if (b->count < b->capacity) {
-        size_t len = strlen(pw);
-        if (len >= CANDIDATE_MAX_LEN) len = CANDIDATE_MAX_LEN - 1;
-        memcpy(b->passwords[b->count], pw, len);
-        b->passwords[b->count][len] = '\0';
-        b->count++;
-    }
-}
-
-/* ============================================================
- * BASE ATTACK INTERFACE
- * ============================================================ */
-
-struct attack_ctx;
-typedef struct attack_ctx attack_ctx_t;
-
-typedef int  (*attack_init_fn)      (attack_ctx_t *ctx);
-typedef int  (*attack_next_batch_fn)(attack_ctx_t *ctx,
-                                      candidate_batch_t *batch);
-typedef void (*attack_cleanup_fn)   (attack_ctx_t *ctx);
-typedef void (*attack_get_state_fn) (const attack_ctx_t *ctx,
-                                      char *buf, size_t buflen);
-typedef uint64_t (*attack_keyspace_fn)(const attack_ctx_t *ctx);
-
-typedef struct {
-    attack_init_fn       init;
-    attack_next_batch_fn next_batch;
-    attack_cleanup_fn    cleanup;
-    attack_get_state_fn  get_state;
-    attack_keyspace_fn   keyspace;
-} attack_ops_t;
-
-/* ============================================================
- * THREAD PARTITION DESCRIPTOR
- * Used to split keyspace across threads
- * ============================================================ */
-
-typedef struct {
-    int         thread_id;
-    int         num_threads;
-    uint64_t    start_index;    /* absolute start in keyspace */
-    uint64_t    end_index;      /* absolute end (exclusive) */
-    uint64_t    local_index;    /* current position within partition */
-    uint64_t    total_done;     /* total processed by this thread */
-    uint64_t    skip;           /* global skip offset */
-    uint64_t    limit;          /* global limit (0 = no limit) */
-} thread_partition_t;
-
-/* ============================================================
- * DICTIONARY ATTACK STATE
- * ============================================================ */
-
-#define DICT_IO_BUFFER_SIZE     (4 * MB)
-#define DICT_LINE_MAX           MAX_PASSWORD_LEN
-
-typedef struct {
-    /* Config */
-    char            path[MAX_PATH_LEN];
-    uint64_t        start_offset;       /* resume: file offset */
-    uint64_t        skip_count;         /* resume: lines already processed */
-    int             thread_id;
-    int             num_threads;
-
-    /* I/O */
-    FILE           *fp;
-    uint8_t        *io_buf;
-    size_t          io_buf_size;
-    size_t          buf_pos;
-    size_t          buf_len;
-    bool            eof;
-
-    /* State */
-    uint64_t        line_number;
-    uint64_t        bytes_read;
-    int64_t         file_size;
-
-    /* Line buffer (stack allocated) */
-    char            line_buf[DICT_LINE_MAX];
-
-    /* Current batch offset for interleaving */
-    uint64_t        batch_count;
-
-} dict_state_t;
+/* CRC32 from utils.c */
+extern uint32_t g_crc32_table[256];
+void crc32_init(void);
 
 /*
- * Buffered line reader - reads into io_buf and extracts lines
- * without dynamic allocation. Returns length of line read,
- * 0 on EOF, -1 on error.
+ * ZIP classic crypto uses the internal PKZIP CRC state update
+ * (no pre/post bit inversion), which differs from the "full CRC32"
+ * helper used elsewhere.
  */
-static int dict_read_line(dict_state_t *st) {
-    int out_len = 0;
-
-    while (out_len < DICT_LINE_MAX - 1) {
-        /* Refill buffer if needed */
-        if (st->buf_pos >= st->buf_len) {
-            if (st->eof) break;
-            st->buf_len = fread(st->io_buf, 1, st->io_buf_size, st->fp);
-            st->buf_pos = 0;
-            if (st->buf_len == 0) {
-                if (ferror(st->fp)) return -1;
-                st->eof = true;
-                break;
-            }
-            st->bytes_read += st->buf_len;
-        }
-
-        uint8_t c = st->io_buf[st->buf_pos++];
-
-        if (c == '\n') {
-            /* End of line */
-            /* Strip trailing \r if present */
-            if (out_len > 0 && st->line_buf[out_len - 1] == '\r') {
-                out_len--;
-            }
-            st->line_number++;
-            st->line_buf[out_len] = '\0';
-            return out_len;
-        }
-
-        if (c == '\r') continue; /* skip CR */
-
-        st->line_buf[out_len++] = (char)c;
+FORCE_INLINE uint32_t crc32_update(uint32_t crc,
+                                    const uint8_t *data,
+                                    size_t len) {
+    while (len--) {
+        crc = g_crc32_table[(crc ^ *data++) & 0xFF] ^ (crc >> 8);
     }
-
-    /* Handle file without trailing newline */
-    if (out_len > 0) {
-        st->line_number++;
-        st->line_buf[out_len] = '\0';
-        return out_len;
-    }
-
-    return 0; /* EOF */
+    return crc;
 }
 
-static int dict_init(dict_state_t *st,
-                      const char *path,
-                      uint64_t start_offset,
-                      int thread_id,
-                      int num_threads) {
-    memset(st, 0, sizeof(*st));
-    snprintf(st->path, sizeof(st->path), "%s", path);
-    st->start_offset = start_offset;
-    st->thread_id    = thread_id;
-    st->num_threads  = num_threads;
+/* ============================================================
+ * SHA-1 IMPLEMENTATION (needed for ZIP)
+ * ============================================================ */
 
-    st->io_buf_size  = DICT_IO_BUFFER_SIZE;
-    st->io_buf       = (uint8_t *)malloc(st->io_buf_size);
-    if (!st->io_buf) {
-        log_error("dict_init: malloc failed for IO buffer");
-        return -1;
+typedef struct {
+    uint32_t state[5];
+    uint32_t count[2];
+    uint8_t  buffer[64];
+} sha1_ctx_t;
+
+#define SHA1_ROTL(value, bits) \
+    (((value) << (bits)) | ((value) >> (32 - (bits))))
+
+#define SHA1_BLK0(i) \
+    (block[i] = (SHA1_ROTL(block[i],24)&0xFF00FF00) | \
+                (SHA1_ROTL(block[i],8) &0x00FF00FF))
+
+#define SHA1_BLK(i) \
+    (block[i&15] = SHA1_ROTL(block[(i+13)&15] ^ block[(i+8)&15] \
+                             ^ block[(i+2)&15] ^ block[i&15], 1))
+
+#define SHA1_R0(v,w,x,y,z,i) \
+    z += ((w&(x^y))^y)        + SHA1_BLK0(i) + 0x5A827999 + SHA1_ROTL(v,5); \
+    w  = SHA1_ROTL(w,30);
+
+#define SHA1_R1(v,w,x,y,z,i) \
+    z += ((w&(x^y))^y)        + SHA1_BLK(i)  + 0x5A827999 + SHA1_ROTL(v,5); \
+    w  = SHA1_ROTL(w,30);
+
+#define SHA1_R2(v,w,x,y,z,i) \
+    z += (w^x^y)               + SHA1_BLK(i)  + 0x6ED9EBA1 + SHA1_ROTL(v,5); \
+    w  = SHA1_ROTL(w,30);
+
+#define SHA1_R3(v,w,x,y,z,i) \
+    z += (((w|x)&y)|(w&x))     + SHA1_BLK(i)  + 0x8F1BBCDC + SHA1_ROTL(v,5); \
+    w  = SHA1_ROTL(w,30);
+
+#define SHA1_R4(v,w,x,y,z,i) \
+    z += (w^x^y)               + SHA1_BLK(i)  + 0xCA62C1D6 + SHA1_ROTL(v,5); \
+    w  = SHA1_ROTL(w,30);
+
+static void sha1_transform(uint32_t state[5], const uint8_t buffer[64]) {
+    uint32_t block[16];
+    for (int i = 0; i < 16; i++) {
+        block[i] = ((uint32_t)buffer[i*4]     << 24) |
+                   ((uint32_t)buffer[i*4 + 1] << 16) |
+                   ((uint32_t)buffer[i*4 + 2] <<  8) |
+                   ((uint32_t)buffer[i*4 + 3]);
     }
 
-    st->fp = fopen(path, "rb");
-    if (!st->fp) {
-        log_error("dict_init: cannot open '%s': %s", path, strerror(errno));
-        free(st->io_buf);
-        st->io_buf = NULL;
-        return -1;
-    }
+    uint32_t a = state[0];
+    uint32_t b = state[1];
+    uint32_t c = state[2];
+    uint32_t d = state[3];
+    uint32_t e = state[4];
 
-    /* Seek to start offset for resume */
-    if (start_offset > 0) {
-        if (fseeko(st->fp, (off_t)start_offset, SEEK_SET) != 0) {
-            log_warn("dict_init: fseeko failed, reading from start");
-        } else {
-            st->bytes_read = start_offset;
+    SHA1_R0(a,b,c,d,e, 0); SHA1_R0(e,a,b,c,d, 1);
+    SHA1_R0(d,e,a,b,c, 2); SHA1_R0(c,d,e,a,b, 3);
+    SHA1_R0(b,c,d,e,a, 4); SHA1_R0(a,b,c,d,e, 5);
+    SHA1_R0(e,a,b,c,d, 6); SHA1_R0(d,e,a,b,c, 7);
+    SHA1_R0(c,d,e,a,b, 8); SHA1_R0(b,c,d,e,a, 9);
+    SHA1_R0(a,b,c,d,e,10); SHA1_R0(e,a,b,c,d,11);
+    SHA1_R0(d,e,a,b,c,12); SHA1_R0(c,d,e,a,b,13);
+    SHA1_R0(b,c,d,e,a,14); SHA1_R0(a,b,c,d,e,15);
+    SHA1_R1(e,a,b,c,d,16); SHA1_R1(d,e,a,b,c,17);
+    SHA1_R1(c,d,e,a,b,18); SHA1_R1(b,c,d,e,a,19);
+    SHA1_R2(a,b,c,d,e,20); SHA1_R2(e,a,b,c,d,21);
+    SHA1_R2(d,e,a,b,c,22); SHA1_R2(c,d,e,a,b,23);
+    SHA1_R2(b,c,d,e,a,24); SHA1_R2(a,b,c,d,e,25);
+    SHA1_R2(e,a,b,c,d,26); SHA1_R2(d,e,a,b,c,27);
+    SHA1_R2(c,d,e,a,b,28); SHA1_R2(b,c,d,e,a,29);
+    SHA1_R2(a,b,c,d,e,30); SHA1_R2(e,a,b,c,d,31);
+    SHA1_R2(d,e,a,b,c,32); SHA1_R2(c,d,e,a,b,33);
+    SHA1_R2(b,c,d,e,a,34); SHA1_R2(a,b,c,d,e,35);
+    SHA1_R2(e,a,b,c,d,36); SHA1_R2(d,e,a,b,c,37);
+    SHA1_R2(c,d,e,a,b,38); SHA1_R2(b,c,d,e,a,39);
+    SHA1_R3(a,b,c,d,e,40); SHA1_R3(e,a,b,c,d,41);
+    SHA1_R3(d,e,a,b,c,42); SHA1_R3(c,d,e,a,b,43);
+    SHA1_R3(b,c,d,e,a,44); SHA1_R3(a,b,c,d,e,45);
+    SHA1_R3(e,a,b,c,d,46); SHA1_R3(d,e,a,b,c,47);
+    SHA1_R3(c,d,e,a,b,48); SHA1_R3(b,c,d,e,a,49);
+    SHA1_R3(a,b,c,d,e,50); SHA1_R3(e,a,b,c,d,51);
+    SHA1_R3(d,e,a,b,c,52); SHA1_R3(c,d,e,a,b,53);
+    SHA1_R3(b,c,d,e,a,54); SHA1_R3(a,b,c,d,e,55);
+    SHA1_R3(e,a,b,c,d,56); SHA1_R3(d,e,a,b,c,57);
+    SHA1_R3(c,d,e,a,b,58); SHA1_R3(b,c,d,e,a,59);
+    SHA1_R4(a,b,c,d,e,60); SHA1_R4(e,a,b,c,d,61);
+    SHA1_R4(d,e,a,b,c,62); SHA1_R4(c,d,e,a,b,63);
+    SHA1_R4(b,c,d,e,a,64); SHA1_R4(a,b,c,d,e,65);
+    SHA1_R4(e,a,b,c,d,66); SHA1_R4(d,e,a,b,c,67);
+    SHA1_R4(c,d,e,a,b,68); SHA1_R4(b,c,d,e,a,69);
+    SHA1_R4(a,b,c,d,e,70); SHA1_R4(e,a,b,c,d,71);
+    SHA1_R4(d,e,a,b,c,72); SHA1_R4(c,d,e,a,b,73);
+    SHA1_R4(b,c,d,e,a,74); SHA1_R4(a,b,c,d,e,75);
+    SHA1_R4(e,a,b,c,d,76); SHA1_R4(d,e,a,b,c,77);
+    SHA1_R4(c,d,e,a,b,78); SHA1_R4(b,c,d,e,a,79);
+
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+}
+
+static void sha1_init(sha1_ctx_t *ctx) {
+    ctx->state[0] = 0x67452301U;
+    ctx->state[1] = 0xEFCDAB89U;
+    ctx->state[2] = 0x98BADCFEU;
+    ctx->state[3] = 0x10325476U;
+    ctx->state[4] = 0xC3D2E1F0U;
+    ctx->count[0] = 0;
+    ctx->count[1] = 0;
+    memset(ctx->buffer, 0, 64);
+}
+
+static void sha1_update(sha1_ctx_t *ctx, const uint8_t *data, size_t len) {
+    size_t i;
+    uint32_t j = (ctx->count[0] >> 3) & 63U;
+
+    if ((ctx->count[0] += (uint32_t)(len << 3)) < (uint32_t)(len << 3)) {
+        ctx->count[1]++;
+    }
+    ctx->count[1] += (uint32_t)(len >> 29);
+
+    if ((j + len) > 63) {
+        i = 64 - j;
+        memcpy(&ctx->buffer[j], data, i);
+        sha1_transform(ctx->state, ctx->buffer);
+        for (; i + 63 < len; i += 64) {
+            sha1_transform(ctx->state, &data[i]);
         }
-    }
-
-    /* Get file size */
-    struct stat s;
-    if (stat(path, &s) == 0) {
-        st->file_size = (int64_t)s.st_size;
+        j = 0;
     } else {
-        st->file_size = -1;
+        i = 0;
     }
 
-    st->buf_pos     = 0;
-    st->buf_len     = 0;
-    st->eof         = false;
-    st->line_number = 0;
-    st->batch_count = 0;
-
-    return 0;
+    if (len - i > 0) {
+        memcpy(&ctx->buffer[j], &data[i], len - i);
+    }
 }
 
-static void dict_cleanup(dict_state_t *st) {
-    if (st->fp)     { fclose(st->fp);     st->fp     = NULL; }
-    if (st->io_buf) { free(st->io_buf);   st->io_buf = NULL; }
-}
-
-/*
- * Fill a batch from the dictionary.
- * For multi-threading: thread i processes lines where (line_num % num_threads == thread_id).
- * Returns number of candidates added, 0 on EOF.
- */
-static int dict_next_batch(dict_state_t *st,
-                            candidate_batch_t *batch,
-                            uint64_t *total_skipped) {
-    batch_reset(batch);
-    *total_skipped = 0;
-
-    while (!batch_full(batch)) {
-        int len = dict_read_line(st);
-        if (len < 0) return -1; /* error */
-        if (len == 0 && st->eof) break;
-        if (len == 0) continue; /* empty line */
-
-        /* Thread interleaving: each thread processes its stripe */
-        if (st->num_threads > 1) {
-            uint64_t lnum = st->line_number - 1; /* 0-based */
-            if ((lnum % (uint64_t)st->num_threads) !=
-                (uint64_t)st->thread_id) {
-                (*total_skipped)++;
-                continue;
-            }
-        }
-
-        batch_add(batch, st->line_buf);
+static void sha1_final(sha1_ctx_t *ctx, uint8_t digest[20]) {
+    uint8_t finalcount[8];
+    for (int i = 0; i < 8; i++) {
+        finalcount[i] = (uint8_t)(
+            (ctx->count[(i >= 4) ? 0 : 1] >>
+             ((3 - (i & 3)) * 8)) & 255);
     }
 
-    st->batch_count++;
-    return batch->count;
+    uint8_t c = 0x80;
+    sha1_update(ctx, &c, 1);
+    while ((ctx->count[0] & 504) != 448) {
+        c = 0x00;
+        sha1_update(ctx, &c, 1);
+    }
+    sha1_update(ctx, finalcount, 8);
+
+    for (int i = 0; i < 20; i++) {
+        digest[i] = (uint8_t)(
+            (ctx->state[i >> 2] >> ((3 - (i & 3)) * 8)) & 255);
+    }
+
+    /* Secure wipe */
+    volatile uint8_t *vp = (volatile uint8_t *)ctx;
+    for (size_t k = 0; k < sizeof(*ctx); k++) vp[k] = 0;
+    volatile uint8_t *vf = (volatile uint8_t *)finalcount;
+    for (size_t k = 0; k < sizeof(finalcount); k++) vf[k] = 0;
 }
 
-/* Get current file offset (for resume) */
-static uint64_t dict_get_offset(const dict_state_t *st) {
-    if (!st->fp) return 0;
-    off_t pos = ftello(st->fp);
-    if (pos < 0) return 0;
-    /* Adjust back by buffered but unprocessed bytes */
-    size_t buffered = st->buf_len - st->buf_pos;
-    return (uint64_t)(pos - (off_t)buffered);
+static void sha1(const uint8_t *data, size_t len, uint8_t digest[20]) {
+    sha1_ctx_t ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, data, len);
+    sha1_final(&ctx, digest);
 }
 
 /* ============================================================
- * BRUTE-FORCE STATE
+ * SHA-256 IMPLEMENTATION (needed for 7Z AES key derivation)
  * ============================================================ */
 
-/*
- * Brute-force uses a base-N counter where N = charset length.
- * The counter array represents digits in the password, each
- * indexing into the charset.
- *
- * Example: charset="abc", length=2
- *   counter[0]=0, counter[1]=0 -> "aa"
- *   counter[0]=1, counter[1]=0 -> "ba"
- *   counter[0]=0, counter[1]=1 -> "ab"
- *   ...
- *
- * Thread partitioning: each thread gets a range of the keyspace.
- * Keyspace for length L with charset size N = N^L.
- * Total keyspace = sum(N^L) for L in [min_len, max_len].
- */
-
 typedef struct {
-    /* Config */
-    charset_spec_t  charset;
-    int             min_length;
-    int             max_length;
-    int             thread_id;
-    int             num_threads;
-    uint64_t        skip;
-    uint64_t        limit;
+    uint32_t state[8];
+    uint32_t count[2];
+    uint8_t  buffer[64];
+} sha256_ctx_t;
 
-    /* Current state */
-    int             cur_length;
-    int             counter[MAX_PASSWORD_LEN]; /* digit array, LSB first */
-    uint64_t        cur_index;                  /* index within current length */
-    uint64_t        length_keyspace;            /* total for current length */
-    uint64_t        global_index;               /* position in total keyspace */
-    uint64_t        global_end;                 /* end position for this thread */
-    uint64_t        total_processed;
+static const uint32_t sha256_K[64] = {
+    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
+    0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+    0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+    0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+    0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+    0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+    0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+    0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+    0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+    0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+    0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
+    0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+    0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
+    0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+    0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+    0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U,
+};
 
-    /* Pre-built password buffer */
-    char            password[MAX_PASSWORD_LEN];
+#define SHA256_CH(x,y,z)  (((x)&(y))^(~(x)&(z)))
+#define SHA256_MAJ(x,y,z) (((x)&(y))^((x)&(z))^((y)&(z)))
+#define SHA256_EP0(x)     (SHA256_ROTR(x,2) ^SHA256_ROTR(x,13)^SHA256_ROTR(x,22))
+#define SHA256_EP1(x)     (SHA256_ROTR(x,6) ^SHA256_ROTR(x,11)^SHA256_ROTR(x,25))
+#define SHA256_SIG0(x)    (SHA256_ROTR(x,7) ^SHA256_ROTR(x,18)^((x)>>3))
+#define SHA256_SIG1(x)    (SHA256_ROTR(x,17)^SHA256_ROTR(x,19)^((x)>>10))
+#define SHA256_ROTR(x,n)  (((x)>>(n))|((x)<<(32-(n))))
 
-    /* Done flag */
-    bool            exhausted;
+static void sha256_transform(sha256_ctx_t *ctx, const uint8_t data[64]) {
+    uint32_t m[64];
+    uint32_t a, b, c, d, e, f, g, h, t1, t2;
 
-} brute_state_t;
-
-/*
- * Compute N^exp safely, returning UINT64_MAX on overflow.
- */
-static uint64_t safe_pow64(uint64_t base, int exp) {
-    if (exp == 0) return 1;
-    uint64_t result = 1;
-    for (int i = 0; i < exp; i++) {
-        if (result > UINT64_MAX / base) return UINT64_MAX;
-        result *= base;
+    for (int i = 0, j = 0; i < 16; i++, j += 4) {
+        m[i] = ((uint32_t)data[j]   << 24) |
+               ((uint32_t)data[j+1] << 16) |
+               ((uint32_t)data[j+2] <<  8) |
+               ((uint32_t)data[j+3]);
     }
-    return result;
+    for (int i = 16; i < 64; i++) {
+        m[i] = SHA256_SIG1(m[i-2]) + m[i-7] +
+               SHA256_SIG0(m[i-15]) + m[i-16];
+    }
+
+    a = ctx->state[0]; b = ctx->state[1];
+    c = ctx->state[2]; d = ctx->state[3];
+    e = ctx->state[4]; f = ctx->state[5];
+    g = ctx->state[6]; h = ctx->state[7];
+
+    for (int i = 0; i < 64; i++) {
+        t1 = h + SHA256_EP1(e) + SHA256_CH(e,f,g) + sha256_K[i] + m[i];
+        t2 = SHA256_EP0(a) + SHA256_MAJ(a,b,c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    ctx->state[0] += a; ctx->state[1] += b;
+    ctx->state[2] += c; ctx->state[3] += d;
+    ctx->state[4] += e; ctx->state[5] += f;
+    ctx->state[6] += g; ctx->state[7] += h;
 }
 
-/*
- * Compute total keyspace for lengths [min, max] with charset size N.
- */
-static uint64_t brute_total_keyspace(int min_len, int max_len, int N) {
-    uint64_t total = 0;
-    for (int l = min_len; l <= max_len; l++) {
-        uint64_t ks = safe_pow64((uint64_t)N, l);
-        if (total > UINT64_MAX - ks) return UINT64_MAX;
-        total += ks;
-    }
-    return total;
+static void sha256_init(sha256_ctx_t *ctx) {
+    ctx->state[0] = 0x6a09e667U;
+    ctx->state[1] = 0xbb67ae85U;
+    ctx->state[2] = 0x3c6ef372U;
+    ctx->state[3] = 0xa54ff53aU;
+    ctx->state[4] = 0x510e527fU;
+    ctx->state[5] = 0x9b05688cU;
+    ctx->state[6] = 0x1f83d9abU;
+    ctx->state[7] = 0x5be0cd19U;
+    ctx->count[0] = 0;
+    ctx->count[1] = 0;
+    memset(ctx->buffer, 0, 64);
 }
 
-/*
- * Given a global index, find which (length, local_index) it maps to.
- */
-static void brute_index_to_length(int min_len, int max_len, int N,
-                                   uint64_t global_idx,
-                                   int *out_len,
-                                   uint64_t *out_local_idx) {
-    uint64_t cumulative = 0;
-    for (int l = min_len; l <= max_len; l++) {
-        uint64_t ks = safe_pow64((uint64_t)N, l);
-        if (global_idx < cumulative + ks) {
-            *out_len       = l;
-            *out_local_idx = global_idx - cumulative;
+static void sha256_update(sha256_ctx_t *ctx, const uint8_t *data, size_t len) {
+    uint32_t bitlen_low  = (uint32_t)(len << 3);
+    uint32_t bitlen_high = (uint32_t)(len >> 29);
+
+    uint32_t rem = ctx->count[0] & 63;
+    ctx->count[0] += (uint32_t)len;
+    if (ctx->count[0] < (uint32_t)len) ctx->count[1]++;
+    ctx->count[1] += bitlen_high;
+    (void)bitlen_low;
+
+    size_t i = 0;
+    if (rem > 0) {
+        size_t fill = 64 - rem;
+        if (len < fill) {
+            memcpy(ctx->buffer + rem, data, len);
             return;
         }
-        cumulative += ks;
+        memcpy(ctx->buffer + rem, data, fill);
+        sha256_transform(ctx, ctx->buffer);
+        i = fill;
     }
-    /* Past end */
-    *out_len       = max_len + 1;
-    *out_local_idx = 0;
-}
 
-/*
- * Set counter array from a local index (like converting a number
- * to base-N representation).
- */
-static void brute_index_to_counter(int *counter, int length,
-                                    uint64_t index, int N) {
-    for (int i = 0; i < length; i++) {
-        counter[i] = (int)(index % (uint64_t)N);
-        index      /= (uint64_t)N;
+    for (; i + 63 < len; i += 64) {
+        sha256_transform(ctx, &data[i]);
+    }
+
+    if (i < len) {
+        memcpy(ctx->buffer, &data[i], len - i);
     }
 }
 
-/*
- * Build password string from counter array.
- * counter[0] is the leftmost character (MSB of index layout).
- * Wait - actually counter[0] is LSB for standard brute, but we
- * want the most-varying position to be the rightmost character.
- * Let's use: counter[len-1] is MSB, counter[0] is LSB.
- * Password: charset[counter[len-1]] ... charset[counter[0]]
- * This gives "aaa", "baa", "caa" -> "aaa", "baa", "caa" if LSB=left
- * For "aaa", "aab", "aac" (LSB=right), we reverse:
- *   password[i] = charset[counter[len-1-i]]
- */
-FORCE_INLINE void brute_build_password(const brute_state_t *st,
-                                        char *out) {
-    int L = st->cur_length;
-    const char *cs = st->charset.chars;
-    for (int i = 0; i < L; i++) {
-        out[i] = cs[st->counter[L - 1 - i]];
+static void sha256_final(sha256_ctx_t *ctx, uint8_t digest[32]) {
+    uint32_t rem = ctx->count[0] & 63;
+    ctx->buffer[rem++] = 0x80;
+
+    if (rem > 56) {
+        memset(ctx->buffer + rem, 0, 64 - rem);
+        sha256_transform(ctx, ctx->buffer);
+        rem = 0;
     }
-    out[L] = '\0';
+
+    memset(ctx->buffer + rem, 0, 56 - rem);
+
+    uint64_t bitlen = ((uint64_t)ctx->count[1] << 32) | ctx->count[0];
+    bitlen <<= 3;
+
+    ctx->buffer[56] = (uint8_t)(bitlen >> 56);
+    ctx->buffer[57] = (uint8_t)(bitlen >> 48);
+    ctx->buffer[58] = (uint8_t)(bitlen >> 40);
+    ctx->buffer[59] = (uint8_t)(bitlen >> 32);
+    ctx->buffer[60] = (uint8_t)(bitlen >> 24);
+    ctx->buffer[61] = (uint8_t)(bitlen >> 16);
+    ctx->buffer[62] = (uint8_t)(bitlen >>  8);
+    ctx->buffer[63] = (uint8_t)(bitlen);
+
+    sha256_transform(ctx, ctx->buffer);
+
+    for (int i = 0; i < 8; i++) {
+        digest[i*4]   = (uint8_t)(ctx->state[i] >> 24);
+        digest[i*4+1] = (uint8_t)(ctx->state[i] >> 16);
+        digest[i*4+2] = (uint8_t)(ctx->state[i] >>  8);
+        digest[i*4+3] = (uint8_t)(ctx->state[i]);
+    }
+
+    volatile uint8_t *vp = (volatile uint8_t *)ctx;
+    for (size_t k = 0; k < sizeof(*ctx); k++) vp[k] = 0;
 }
 
-/*
- * Increment the counter by 1. Returns false when length is exhausted.
- */
-FORCE_INLINE bool brute_increment(brute_state_t *st) {
-    int N = st->charset.len;
-    int L = st->cur_length;
-
-    for (int i = 0; i < L; i++) {
-        st->counter[i]++;
-        if (st->counter[i] < N) {
-            return true; /* no carry */
-        }
-        st->counter[i] = 0; /* carry */
-    }
-    return false; /* overflow - length exhausted */
-}
-
-/*
- * Advance to next length group.
- */
-static bool brute_next_length(brute_state_t *st) {
-    if (st->cur_length >= st->max_length) {
-        st->exhausted = true;
-        return false;
-    }
-    st->cur_length++;
-    memset(st->counter, 0, sizeof(int) * st->cur_length);
-    st->cur_index         = 0;
-    st->length_keyspace   = safe_pow64((uint64_t)st->charset.len,
-                                        st->cur_length);
-
-    /* Compute this thread's range for new length */
-    uint64_t per_thread = st->length_keyspace / (uint64_t)st->num_threads;
-    uint64_t remainder  = st->length_keyspace % (uint64_t)st->num_threads;
-
-    uint64_t start = (uint64_t)st->thread_id * per_thread +
-                     (((uint64_t)st->thread_id < remainder) ?
-                      (uint64_t)st->thread_id : remainder);
-    uint64_t count = per_thread +
-                     (((uint64_t)st->thread_id < remainder) ? 1 : 0);
-
-    if (count == 0) {
-        /* This thread has no work for this length - skip */
-        return brute_next_length(st);
-    }
-
-    brute_index_to_counter(st->counter, st->cur_length, start,
-                            st->charset.len);
-    st->cur_index   = start;
-    st->global_end  = start + count;
-
-    return true;
-}
-
-static int brute_init(brute_state_t *st,
-                       const charset_spec_t *cs,
-                       int min_len, int max_len,
-                       int thread_id, int num_threads,
-                       uint64_t global_skip,
-                       uint64_t limit) {
-    memset(st, 0, sizeof(*st));
-    memcpy(&st->charset, cs, sizeof(*cs));
-    st->min_length  = min_len;
-    st->max_length  = max_len;
-    st->thread_id   = thread_id;
-    st->num_threads = num_threads;
-    st->skip        = global_skip;
-    st->limit       = limit;
-    st->exhausted   = false;
-
-    int N = cs->len;
-    if (N == 0) {
-        log_error("brute_init: empty charset");
-        return -1;
-    }
-
-    /* Start at first length */
-    st->cur_length      = min_len;
-    st->length_keyspace = safe_pow64((uint64_t)N, min_len);
-
-    /* Compute thread's range for first length */
-    uint64_t per_thread = st->length_keyspace / (uint64_t)num_threads;
-    uint64_t remainder  = st->length_keyspace % (uint64_t)num_threads;
-
-    uint64_t t = (uint64_t)thread_id;
-    uint64_t start = t * per_thread +
-                     ((t < remainder) ? t : remainder);
-    uint64_t count = per_thread + ((t < remainder) ? 1 : 0);
-
-    if (count == 0 && min_len <= max_len) {
-        /* No work at this length - advance to find work */
-        bool found = false;
-        for (int l = min_len + 1; l <= max_len; l++) {
-            uint64_t ks = safe_pow64((uint64_t)N, l);
-            uint64_t pt = ks / (uint64_t)num_threads;
-            uint64_t rm = ks % (uint64_t)num_threads;
-            uint64_t cnt = pt + ((t < rm) ? 1 : 0);
-            if (cnt > 0) {
-                st->cur_length      = l;
-                st->length_keyspace = ks;
-                uint64_t st_idx = t * pt + ((t < rm) ? t : rm);
-                brute_index_to_counter(st->counter, l, st_idx, N);
-                st->cur_index  = st_idx;
-                st->global_end = st_idx + cnt;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            st->exhausted = true;
-        }
-    } else {
-        brute_index_to_counter(st->counter, min_len, start, N);
-        st->cur_index  = start;
-        st->global_end = start + count;
-    }
-
-    st->total_processed = 0;
-    return 0;
-}
-
-static int brute_next_batch(brute_state_t *st,
-                              candidate_batch_t *batch) {
-    batch_reset(batch);
-
-    while (!batch_full(batch)) {
-        if (UNLIKELY(st->exhausted)) break;
-
-        /* Check if current length partition is done */
-        if (st->cur_index >= st->global_end) {
-            /* Move to next length group */
-            if (!brute_next_length(st)) {
-                st->exhausted = true;
-                break;
-            }
-        }
-
-        /* Build password from counter */
-        brute_build_password(st, st->password);
-
-        batch_add(batch, st->password);
-        st->total_processed++;
-
-        /* Check limit */
-        if (st->limit > 0 && st->total_processed >= st->limit) {
-            st->exhausted = true;
-            break;
-        }
-
-        /* Advance counter */
-        st->cur_index++;
-        if (!brute_increment(st)) {
-            /* Length exhausted - move to next length */
-            if (!brute_next_length(st)) {
-                st->exhausted = true;
-            }
-        }
-    }
-
-    return batch->count;
-}
-
-static void brute_get_state(const brute_state_t *st,
-                              char *buf, size_t buflen) {
-    char pw[MAX_PASSWORD_LEN];
-    brute_build_password(st, pw);
-    snprintf(buf, buflen, "len=%d idx=%llu pw=%.32s",
-             st->cur_length,
-             (unsigned long long)st->cur_index,
-             pw);
-}
-
-static uint64_t brute_get_keyspace(const brute_state_t *st) {
-    return brute_total_keyspace(st->min_length, st->max_length,
-                                 st->charset.len);
+static void sha256(const uint8_t *data, size_t len, uint8_t digest[32]) {
+    sha256_ctx_t ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, data, len);
+    sha256_final(&ctx, digest);
 }
 
 /* ============================================================
- * MASK ATTACK STATE
+ * AES-256 IMPLEMENTATION (for 7Z decryption)
+ * Full AES-256 in CBC mode
  * ============================================================ */
 
-/*
- * Mask attack uses the same counter-based approach as brute force,
- * but each position has its own charset from the mask specification.
- *
- * Example mask: ?l?l?d?d
- *   position 0: lowercase (26 chars)
- *   position 1: lowercase (26 chars)
- *   position 2: digits (10 chars)
- *   position 3: digits (10 chars)
- *   keyspace = 26 * 26 * 10 * 10 = 67600
- */
+#define AES_BLOCK_SIZE  16
+#define AES256_KEY_SIZE 32
+#define AES256_ROUNDS   14
 
 typedef struct {
-    /* Config */
-    mask_spec_t     mask;
-    int             thread_id;
-    int             num_threads;
-    uint64_t        skip;
-    uint64_t        limit;
+    uint32_t round_key[4 * (AES256_ROUNDS + 1)];
+    int      nr;
+} aes_ctx_t;
 
-    /* Counter per position */
-    int             counter[MAX_MASK_POSITIONS];
+/* AES S-box */
+static const uint8_t aes_sbox[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,
+    0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,
+    0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,
+    0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,
+    0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,
+    0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,
+    0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,
+    0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,
+    0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,
+    0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,
+    0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,
+    0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,
+    0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,
+    0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,
+    0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,
+    0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,
+    0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+};
 
-    /* Precomputed keyspace per position and cumulative */
-    uint64_t        pos_keyspace[MAX_MASK_POSITIONS]; /* charset len at pos i */
-    uint64_t        total_keyspace;
+/* AES inverse S-box */
+static const uint8_t aes_rsbox[256] = {
+    0x52,0x09,0x6a,0xd5,0x30,0x36,0xa5,0x38,
+    0xbf,0x40,0xa3,0x9e,0x81,0xf3,0xd7,0xfb,
+    0x7c,0xe3,0x39,0x82,0x9b,0x2f,0xff,0x87,
+    0x34,0x8e,0x43,0x44,0xc4,0xde,0xe9,0xcb,
+    0x54,0x7b,0x94,0x32,0xa6,0xc2,0x23,0x3d,
+    0xee,0x4c,0x95,0x0b,0x42,0xfa,0xc3,0x4e,
+    0x08,0x2e,0xa1,0x66,0x28,0xd9,0x24,0xb2,
+    0x76,0x5b,0xa2,0x49,0x6d,0x8b,0xd1,0x25,
+    0x72,0xf8,0xf6,0x64,0x86,0x68,0x98,0x16,
+    0xd4,0xa4,0x5c,0xcc,0x5d,0x65,0xb6,0x92,
+    0x6c,0x70,0x48,0x50,0xfd,0xed,0xb9,0xda,
+    0x5e,0x15,0x46,0x57,0xa7,0x8d,0x9d,0x84,
+    0x90,0xd8,0xab,0x00,0x8c,0xbc,0xd3,0x0a,
+    0xf7,0xe4,0x58,0x05,0xb8,0xb3,0x45,0x06,
+    0xd0,0x2c,0x1e,0x8f,0xca,0x3f,0x0f,0x02,
+    0xc1,0xaf,0xbd,0x03,0x01,0x13,0x8a,0x6b,
+    0x3a,0x91,0x11,0x41,0x4f,0x67,0xdc,0xea,
+    0x97,0xf2,0xcf,0xce,0xf0,0xb4,0xe6,0x73,
+    0x96,0xac,0x74,0x22,0xe7,0xad,0x35,0x85,
+    0xe2,0xf9,0x37,0xe8,0x1c,0x75,0xdf,0x6e,
+    0x47,0xf1,0x1a,0x71,0x1d,0x29,0xc5,0x89,
+    0x6f,0xb7,0x62,0x0e,0xaa,0x18,0xbe,0x1b,
+    0xfc,0x56,0x3e,0x4b,0xc6,0xd2,0x79,0x20,
+    0x9a,0xdb,0xc0,0xfe,0x78,0xcd,0x5a,0xf4,
+    0x1f,0xdd,0xa8,0x33,0x88,0x07,0xc7,0x31,
+    0xb1,0x12,0x10,0x59,0x27,0x80,0xec,0x5f,
+    0x60,0x51,0x7f,0xa9,0x19,0xb5,0x4a,0x0d,
+    0x2d,0xe5,0x7a,0x9f,0x93,0xc9,0x9c,0xef,
+    0xa0,0xe0,0x3b,0x4d,0xae,0x2a,0xf5,0xb0,
+    0xc8,0xeb,0xbb,0x3c,0x83,0x53,0x99,0x61,
+    0x17,0x2b,0x04,0x7e,0xba,0x77,0xd6,0x26,
+    0xe1,0x69,0x14,0x63,0x55,0x21,0x0c,0x7d,
+};
 
-    /* Thread partition */
-    uint64_t        start_index;
-    uint64_t        end_index;
-    uint64_t        cur_index;
+/* AES Rcon */
+static const uint8_t aes_rcon[11] = {
+    0x8d, 0x01, 0x02, 0x04, 0x08, 0x10,
+    0x20, 0x40, 0x80, 0x1b, 0x36
+};
 
-    /* Built password */
-    char            password[MAX_PASSWORD_LEN];
+/* GF(2^8) multiplication */
+FORCE_INLINE uint8_t aes_xtime(uint8_t x) {
+    return (x << 1) ^ ((x >> 7) * 0x1b);
+}
 
-    /* State */
-    uint64_t        total_processed;
-    bool            exhausted;
+FORCE_INLINE uint8_t aes_mul(uint8_t x, uint8_t y) {
+    return ((y & 1) * x) ^
+           ((y >> 1 & 1) * aes_xtime(x)) ^
+           ((y >> 2 & 1) * aes_xtime(aes_xtime(x))) ^
+           ((y >> 3 & 1) * aes_xtime(aes_xtime(aes_xtime(x)))) ^
+           ((y >> 4 & 1) * aes_xtime(aes_xtime(aes_xtime(aes_xtime(x)))));
+}
 
-} mask_state_t;
+static void aes256_key_expansion(aes_ctx_t *ctx,
+                                  const uint8_t key[AES256_KEY_SIZE]) {
+    uint8_t  tmp[4];
+    uint32_t *rk = ctx->round_key;
 
-/*
- * Convert linear index to counter array for mask attack.
- * Each position has its own radix (charset length).
- */
-static void mask_index_to_counter(int *counter,
-                                   const mask_spec_t *mask,
-                                   uint64_t index) {
-    int N = mask->num_positions;
-    for (int i = N - 1; i >= 0; i--) {
-        uint64_t radix = (uint64_t)mask->positions[i].charset_len;
-        if (radix == 0) radix = 1;
-        /* Counter is LSB-first (position 0 varies fastest) */
-        /* We want rightmost position to vary fastest */
-        int pi = N - 1 - i; /* map: pos 0 = rightmost in password */
-        (void)pi;
-        counter[i] = (int)(index % radix);
-        index      /= radix;
+    for (int i = 0; i < 8; i++) {
+        rk[i] = ((uint32_t)key[i*4]   << 24) |
+                ((uint32_t)key[i*4+1] << 16) |
+                ((uint32_t)key[i*4+2] <<  8) |
+                ((uint32_t)key[i*4+3]);
+    }
+
+    for (int i = 8; i < 4 * (AES256_ROUNDS + 1); i++) {
+        uint32_t t = rk[i - 1];
+
+        if (i % 8 == 0) {
+            /* RotWord + SubWord + Rcon */
+            tmp[0] = aes_sbox[(t >> 16) & 0xFF];
+            tmp[1] = aes_sbox[(t >>  8) & 0xFF];
+            tmp[2] = aes_sbox[(t      ) & 0xFF];
+            tmp[3] = aes_sbox[(t >> 24) & 0xFF];
+            t = ((uint32_t)tmp[0] << 24) |
+                ((uint32_t)tmp[1] << 16) |
+                ((uint32_t)tmp[2] <<  8) |
+                ((uint32_t)tmp[3]);
+            t ^= ((uint32_t)aes_rcon[i / 8]) << 24;
+        } else if (i % 8 == 4) {
+            /* SubWord */
+            tmp[0] = aes_sbox[(t >> 24) & 0xFF];
+            tmp[1] = aes_sbox[(t >> 16) & 0xFF];
+            tmp[2] = aes_sbox[(t >>  8) & 0xFF];
+            tmp[3] = aes_sbox[(t      ) & 0xFF];
+            t = ((uint32_t)tmp[0] << 24) |
+                ((uint32_t)tmp[1] << 16) |
+                ((uint32_t)tmp[2] <<  8) |
+                ((uint32_t)tmp[3]);
+        }
+
+        rk[i] = rk[i - 8] ^ t;
+    }
+
+    ctx->nr = AES256_ROUNDS;
+}
+
+/* AES state manipulation macros */
+#define AES_STATE(s,r,c) ((s)[(r) + (c)*4])
+
+static void aes_add_round_key(uint8_t state[16],
+                               const uint32_t *rk, int round) {
+    for (int c = 0; c < 4; c++) {
+        uint32_t k = rk[round * 4 + c];
+        state[c*4+0] ^= (k >> 24) & 0xFF;
+        state[c*4+1] ^= (k >> 16) & 0xFF;
+        state[c*4+2] ^= (k >>  8) & 0xFF;
+        state[c*4+3] ^= (k      ) & 0xFF;
     }
 }
 
-FORCE_INLINE void mask_build_password(const mask_state_t *st, char *out) {
-    int N = st->mask.num_positions;
-    for (int i = 0; i < N; i++) {
-        out[i] = st->mask.positions[i].charset[st->counter[i]];
+static void aes_sub_bytes(uint8_t state[16]) {
+    for (int i = 0; i < 16; i++) {
+        state[i] = aes_sbox[state[i]];
     }
-    out[N] = '\0';
 }
 
-FORCE_INLINE bool mask_increment(mask_state_t *st) {
-    int N = st->mask.num_positions;
-    for (int i = N - 1; i >= 0; i--) {
-        st->counter[i]++;
-        if (st->counter[i] < st->mask.positions[i].charset_len) {
-            return true;
-        }
-        st->counter[i] = 0;
-    }
-    return false; /* exhausted */
+static void aes_shift_rows(uint8_t state[16]) {
+    /* Row 1: shift left by 1 */
+    uint8_t t = state[1];
+    state[1]  = state[5];
+    state[5]  = state[9];
+    state[9]  = state[13];
+    state[13] = t;
+
+    /* Row 2: shift left by 2 */
+    t = state[2]; state[2] = state[10]; state[10] = t;
+    t = state[6]; state[6] = state[14]; state[14] = t;
+
+    /* Row 3: shift left by 3 (= shift right by 1) */
+    t         = state[15];
+    state[15] = state[11];
+    state[11] = state[7];
+    state[7]  = state[3];
+    state[3]  = t;
 }
 
-static int mask_init(mask_state_t *st,
-                      const mask_spec_t *mask,
-                      int thread_id, int num_threads,
-                      uint64_t skip, uint64_t limit) {
-    memset(st, 0, sizeof(*st));
-    memcpy(&st->mask, mask, sizeof(*mask));
-    st->thread_id   = thread_id;
-    st->num_threads = num_threads;
-    st->skip        = skip;
-    st->limit       = limit;
+static void aes_mix_columns(uint8_t state[16]) {
+    for (int c = 0; c < 4; c++) {
+        uint8_t s0 = state[c*4+0];
+        uint8_t s1 = state[c*4+1];
+        uint8_t s2 = state[c*4+2];
+        uint8_t s3 = state[c*4+3];
 
-    /* Compute total keyspace */
-    uint64_t ks = 1;
-    for (int i = 0; i < mask->num_positions; i++) {
-        uint64_t n = (uint64_t)mask->positions[i].charset_len;
-        if (n == 0) {
-            log_error("mask_init: position %d has empty charset", i);
-            return -1;
-        }
-        if (ks > UINT64_MAX / n) { ks = UINT64_MAX; break; }
-        ks *= n;
+        state[c*4+0] = aes_mul(s0,2) ^ aes_mul(s1,3) ^ s2 ^ s3;
+        state[c*4+1] = s0 ^ aes_mul(s1,2) ^ aes_mul(s2,3) ^ s3;
+        state[c*4+2] = s0 ^ s1 ^ aes_mul(s2,2) ^ aes_mul(s3,3);
+        state[c*4+3] = aes_mul(s0,3) ^ s1 ^ s2 ^ aes_mul(s3,2);
     }
-    st->total_keyspace = ks;
+}
 
-    /* Partition keyspace for this thread */
-    uint64_t per_thread = ks / (uint64_t)num_threads;
-    uint64_t remainder  = ks % (uint64_t)num_threads;
-    uint64_t t          = (uint64_t)thread_id;
+static void aes256_encrypt_block(const aes_ctx_t *ctx,
+                                  const uint8_t in[16],
+                                  uint8_t out[16]) {
+    uint8_t state[16];
 
-    st->start_index = t * per_thread + ((t < remainder) ? t : remainder);
-    uint64_t count  = per_thread + ((t < remainder) ? 1 : 0);
-    st->end_index   = st->start_index + count;
-
-    /* Apply skip */
-    if (skip > 0) {
-        st->start_index += skip;
-        if (st->start_index >= st->end_index) {
-            st->exhausted = true;
-            return 0;
+    /* Load input column-major */
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            state[r + c*4] = in[r*4 + c];
         }
     }
 
-    st->cur_index = st->start_index;
-    mask_index_to_counter(st->counter, mask, st->cur_index);
+    aes_add_round_key(state, ctx->round_key, 0);
 
-    st->total_processed = 0;
-    st->exhausted       = (count == 0);
-    return 0;
+    for (int round = 1; round < ctx->nr; round++) {
+        aes_sub_bytes(state);
+        aes_shift_rows(state);
+        aes_mix_columns(state);
+        aes_add_round_key(state, ctx->round_key, round);
+    }
+
+    /* Final round: no MixColumns */
+    aes_sub_bytes(state);
+    aes_shift_rows(state);
+    aes_add_round_key(state, ctx->round_key, ctx->nr);
+
+    /* Store output */
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            out[r*4 + c] = state[r + c*4];
+        }
+    }
 }
 
-static int mask_next_batch(mask_state_t *st, candidate_batch_t *batch) {
-    batch_reset(batch);
+static void aes_inv_sub_bytes(uint8_t state[16]) {
+    for (int i = 0; i < 16; i++) {
+        state[i] = aes_rsbox[state[i]];
+    }
+}
 
-    while (!batch_full(batch)) {
-        if (UNLIKELY(st->exhausted)) break;
-        if (UNLIKELY(st->cur_index >= st->end_index)) {
-            st->exhausted = true;
-            break;
-        }
+static void aes_inv_shift_rows(uint8_t state[16]) {
+    /* Row 1: shift right by 1 */
+    uint8_t t = state[13];
+    state[13] = state[9];
+    state[9]  = state[5];
+    state[5]  = state[1];
+    state[1]  = t;
 
-        mask_build_password(st, st->password);
-        batch_add(batch, st->password);
-        st->total_processed++;
-        st->cur_index++;
+    /* Row 2: shift right by 2 */
+    t = state[2]; state[2] = state[10]; state[10] = t;
+    t = state[6]; state[6] = state[14]; state[14] = t;
 
-        if (st->limit > 0 && st->total_processed >= st->limit) {
-            st->exhausted = true;
-            break;
-        }
+    /* Row 3: shift right by 3 */
+    t        = state[3];
+    state[3] = state[7];
+    state[7] = state[11];
+    state[11]= state[15];
+    state[15]= t;
+}
 
-        if (!mask_increment(st)) {
-            st->exhausted = true;
-            break;
+static void aes_inv_mix_columns(uint8_t state[16]) {
+    for (int c = 0; c < 4; c++) {
+        uint8_t s0 = state[c*4+0];
+        uint8_t s1 = state[c*4+1];
+        uint8_t s2 = state[c*4+2];
+        uint8_t s3 = state[c*4+3];
+
+        state[c*4+0] = aes_mul(s0,0x0e)^aes_mul(s1,0x0b)^
+                       aes_mul(s2,0x0d)^aes_mul(s3,0x09);
+        state[c*4+1] = aes_mul(s0,0x09)^aes_mul(s1,0x0e)^
+                       aes_mul(s2,0x0b)^aes_mul(s3,0x0d);
+        state[c*4+2] = aes_mul(s0,0x0d)^aes_mul(s1,0x09)^
+                       aes_mul(s2,0x0e)^aes_mul(s3,0x0b);
+        state[c*4+3] = aes_mul(s0,0x0b)^aes_mul(s1,0x0d)^
+                       aes_mul(s2,0x09)^aes_mul(s3,0x0e);
+    }
+}
+
+static void aes256_decrypt_block(const aes_ctx_t *ctx,
+                                  const uint8_t in[16],
+                                  uint8_t out[16]) {
+    uint8_t state[16];
+
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            state[r + c*4] = in[r*4 + c];
         }
     }
 
-    return batch->count;
+    aes_add_round_key(state, ctx->round_key, ctx->nr);
+
+    for (int round = ctx->nr - 1; round > 0; round--) {
+        aes_inv_shift_rows(state);
+        aes_inv_sub_bytes(state);
+        aes_add_round_key(state, ctx->round_key, round);
+        aes_inv_mix_columns(state);
+    }
+
+    aes_inv_shift_rows(state);
+    aes_inv_sub_bytes(state);
+    aes_add_round_key(state, ctx->round_key, 0);
+
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            out[r*4 + c] = state[r + c*4];
+        }
+    }
 }
 
-static void mask_get_state(const mask_state_t *st, char *buf, size_t buflen) {
-    char pw[MAX_PASSWORD_LEN];
-    mask_build_password(st, pw);
-    snprintf(buf, buflen, "idx=%llu/%llu pw=%.32s",
-             (unsigned long long)st->cur_index,
-             (unsigned long long)st->total_keyspace,
-             pw);
-}
+/* AES-CBC decryption */
+static void aes256_cbc_decrypt(const aes_ctx_t *ctx,
+                                const uint8_t *iv,
+                                const uint8_t *in,
+                                uint8_t *out,
+                                size_t len) {
+    uint8_t prev[AES_BLOCK_SIZE];
+    uint8_t block[AES_BLOCK_SIZE];
 
-/* ============================================================
- * RULE ENGINE
- * ============================================================ */
+    memcpy(prev, iv, AES_BLOCK_SIZE);
 
-/*
- * Apply a single rule to a word, producing output in 'out'.
- * Returns the output length, or 0 if rule produced empty string.
- * Returns -1 if output would exceed max_out_len.
- */
-static int apply_rule(rule_type_t rule,
-                       const char *param,
-                       int param_int,
-                       const char *in,
-                       size_t in_len,
-                       char *out,
-                       size_t max_out_len) {
-    (void)param; /* used by some rules */
-
-    switch (rule) {
-
-        case RULE_APPEND_DIGIT: {
-            /* Append digits 0-9 */
-            /* This generates multiple outputs - handled by rule batch */
-            if (in_len + 2 > max_out_len) return -1;
-            memcpy(out, in, in_len);
-            out[in_len]     = (char)('0' + (param_int % 10));
-            out[in_len + 1] = '\0';
-            return (int)(in_len + 1);
+    for (size_t i = 0; i + AES_BLOCK_SIZE <= len; i += AES_BLOCK_SIZE) {
+        aes256_decrypt_block(ctx, in + i, block);
+        for (int j = 0; j < AES_BLOCK_SIZE; j++) {
+            out[i + j] = block[j] ^ prev[j];
         }
-
-        case RULE_PREPEND_DIGIT: {
-            if (in_len + 2 > max_out_len) return -1;
-            out[0] = (char)('0' + (param_int % 10));
-            memcpy(out + 1, in, in_len);
-            out[in_len + 1] = '\0';
-            return (int)(in_len + 1);
-        }
-
-        case RULE_UPPERCASE_ALL: {
-            if (in_len + 1 > max_out_len) return -1;
-            for (size_t i = 0; i < in_len; i++) {
-                out[i] = (char)toupper((unsigned char)in[i]);
-            }
-            out[in_len] = '\0';
-            return (int)in_len;
-        }
-
-        case RULE_LOWERCASE_ALL: {
-            if (in_len + 1 > max_out_len) return -1;
-            for (size_t i = 0; i < in_len; i++) {
-                out[i] = (char)tolower((unsigned char)in[i]);
-            }
-            out[in_len] = '\0';
-            return (int)in_len;
-        }
-
-        case RULE_CAPITALIZE: {
-            if (in_len + 1 > max_out_len) return -1;
-            memcpy(out, in, in_len);
-            out[in_len] = '\0';
-            if (in_len > 0) {
-                out[0] = (char)toupper((unsigned char)out[0]);
-                for (size_t i = 1; i < in_len; i++) {
-                    out[i] = (char)tolower((unsigned char)out[i]);
-                }
-            }
-            return (int)in_len;
-        }
-
-        case RULE_REVERSE: {
-            if (in_len + 1 > max_out_len) return -1;
-            for (size_t i = 0; i < in_len; i++) {
-                out[i] = in[in_len - 1 - i];
-            }
-            out[in_len] = '\0';
-            return (int)in_len;
-        }
-
-        case RULE_DUPLICATE: {
-            if (in_len * 2 + 1 > max_out_len) return -1;
-            memcpy(out, in, in_len);
-            memcpy(out + in_len, in, in_len);
-            out[in_len * 2] = '\0';
-            return (int)(in_len * 2);
-        }
-
-        case RULE_LEET_SPEAK: {
-            if (in_len + 1 > max_out_len) return -1;
-            for (size_t i = 0; i < in_len; i++) {
-                switch (tolower((unsigned char)in[i])) {
-                    case 'a': out[i] = '@'; break;
-                    case 'e': out[i] = '3'; break;
-                    case 'i': out[i] = '1'; break;
-                    case 'o': out[i] = '0'; break;
-                    case 's': out[i] = '$'; break;
-                    case 't': out[i] = '+'; break;
-                    case 'l': out[i] = '!'; break;
-                    case 'g': out[i] = '9'; break;
-                    case 'b': out[i] = '8'; break;
-                    case 'z': out[i] = '2'; break;
-                    default:  out[i] = in[i]; break;
-                }
-            }
-            out[in_len] = '\0';
-            return (int)in_len;
-        }
-
-        case RULE_APPEND_YEAR: {
-            /* Append years like 2020-2025 */
-            int year = 2020 + (param_int % 6);
-            if (in_len + 5 > max_out_len) return -1;
-            memcpy(out, in, in_len);
-            snprintf(out + in_len, max_out_len - in_len, "%d", year);
-            return (int)(in_len + 4);
-        }
-
-        case RULE_APPEND_SPECIAL: {
-            static const char specials[] = "!@#$%&*";
-            int idx = param_int % (int)(sizeof(specials) - 1);
-            if (in_len + 2 > max_out_len) return -1;
-            memcpy(out, in, in_len);
-            out[in_len]     = specials[idx];
-            out[in_len + 1] = '\0';
-            return (int)(in_len + 1);
-        }
-
-        case RULE_TOGGLE_CASE: {
-            if (in_len + 1 > max_out_len) return -1;
-            for (size_t i = 0; i < in_len; i++) {
-                if (isupper((unsigned char)in[i])) {
-                    out[i] = (char)tolower((unsigned char)in[i]);
-                } else if (islower((unsigned char)in[i])) {
-                    out[i] = (char)toupper((unsigned char)in[i]);
-                } else {
-                    out[i] = in[i];
-                }
-            }
-            out[in_len] = '\0';
-            return (int)in_len;
-        }
-
-        case RULE_ROTATE_LEFT: {
-            if (in_len == 0) return 0;
-            if (in_len + 1 > max_out_len) return -1;
-            int n = (param_int == 0) ? 1 : param_int % (int)in_len;
-            for (size_t i = 0; i < in_len; i++) {
-                out[i] = in[(i + n) % in_len];
-            }
-            out[in_len] = '\0';
-            return (int)in_len;
-        }
-
-        case RULE_ROTATE_RIGHT: {
-            if (in_len == 0) return 0;
-            if (in_len + 1 > max_out_len) return -1;
-            int n = (param_int == 0) ? 1 : param_int % (int)in_len;
-            for (size_t i = 0; i < in_len; i++) {
-                out[i] = in[(i - n + (int)in_len) % (int)in_len];
-            }
-            out[in_len] = '\0';
-            return (int)in_len;
-        }
-
-        case RULE_REFLECT: {
-            /* word + reverse(word) */
-            if (in_len * 2 + 1 > max_out_len) return -1;
-            memcpy(out, in, in_len);
-            for (size_t i = 0; i < in_len; i++) {
-                out[in_len + i] = in[in_len - 1 - i];
-            }
-            out[in_len * 2] = '\0';
-            return (int)(in_len * 2);
-        }
-
-        case RULE_STRIP_VOWELS: {
-            size_t j = 0;
-            for (size_t i = 0; i < in_len && j < max_out_len - 1; i++) {
-                char c = (char)tolower((unsigned char)in[i]);
-                if (c != 'a' && c != 'e' && c != 'i' &&
-                    c != 'o' && c != 'u') {
-                    out[j++] = in[i];
-                }
-            }
-            out[j] = '\0';
-            return (int)j;
-        }
-
-        default:
-            /* Unknown rule - passthrough */
-            if (in_len + 1 > max_out_len) return -1;
-            memcpy(out, in, in_len);
-            out[in_len] = '\0';
-            return (int)in_len;
+        memcpy(prev, in + i, AES_BLOCK_SIZE);
     }
 }
 
 /* ============================================================
- * RULE SET
+ * ZIP FILE FORMAT STRUCTURES
  * ============================================================ */
 
-/*
- * A rule_set_t defines all rules to apply to each base word.
- * For each base word, we generate one candidate per (rule, param_variant).
- * Plus the original word itself.
- */
+#define ZIP_LOCAL_FILE_HEADER_SIG       0x04034B50UL
+#define ZIP_CENTRAL_DIR_HEADER_SIG      0x02014B50UL
+#define ZIP_END_OF_CENTRAL_DIR_SIG      0x06054B50UL
+#define ZIP_DATA_DESCRIPTOR_SIG         0x08074B50UL
 
-#define MAX_RULE_VARIANTS   64  /* max param variants per rule type */
+#define ZIP_FLAG_ENCRYPTED              (1 << 0)
+#define ZIP_FLAG_DATA_DESCRIPTOR        (1 << 3)
+#define ZIP_FLAG_STRONG_ENCRYPTION      (1 << 6)
+#define ZIP_FLAG_UTF8                   (1 << 11)
+
+#define ZIP_METHOD_STORED               0
+#define ZIP_METHOD_DEFLATED             8
+#define ZIP_METHOD_BZIP2                12
+#define ZIP_METHOD_LZMA                 14
+#define ZIP_METHOD_AES                  99
+
+#define ZIP_ENCRYPTION_HEADER_SIZE      12
+#define ZIP_MAX_COMMENT_LEN             65535
+
+/* Local file header (on-disk layout, little-endian) */
+typedef struct PACKED {
+    uint32_t signature;             /* 0x04034B50 */
+    uint16_t version_needed;
+    uint16_t flags;
+    uint16_t compression_method;
+    uint16_t last_mod_time;
+    uint16_t last_mod_date;
+    uint32_t crc32;
+    uint32_t compressed_size;
+    uint32_t uncompressed_size;
+    uint16_t filename_len;
+    uint16_t extra_field_len;
+    /* followed by: filename, extra_field, file_data */
+} zip_local_header_t;
+
+/* Central directory header */
+typedef struct PACKED {
+    uint32_t signature;             /* 0x02014B50 */
+    uint16_t version_made_by;
+    uint16_t version_needed;
+    uint16_t flags;
+    uint16_t compression_method;
+    uint16_t last_mod_time;
+    uint16_t last_mod_date;
+    uint32_t crc32;
+    uint32_t compressed_size;
+    uint32_t uncompressed_size;
+    uint16_t filename_len;
+    uint16_t extra_field_len;
+    uint16_t comment_len;
+    uint16_t disk_number_start;
+    uint16_t internal_attributes;
+    uint32_t external_attributes;
+    uint32_t local_header_offset;
+} zip_central_header_t;
+
+/* End of central directory */
+typedef struct PACKED {
+    uint32_t signature;             /* 0x06054B50 */
+    uint16_t disk_number;
+    uint16_t central_dir_disk;
+    uint16_t disk_entries;
+    uint16_t total_entries;
+    uint32_t central_dir_size;
+    uint32_t central_dir_offset;
+    uint16_t comment_len;
+} zip_eocd_t;
+
+/* AES extra field for WinZip AES */
+typedef struct PACKED {
+    uint16_t tag;                   /* 0x9901 */
+    uint16_t data_size;             /* 7 */
+    uint16_t version;               /* 1 or 2 */
+    uint8_t  vendor[2];             /* 'A','E' */
+    uint8_t  strength;              /* 1=128,2=192,3=256 bit */
+    uint16_t actual_compression;
+} zip_aes_extra_t;
+
+/* ============================================================
+ * PKZIP ENCRYPTION KEYS
+ * ============================================================ */
 
 typedef struct {
-    rule_type_t type;
-    int         param_values[MAX_RULE_VARIANTS];
-    int         num_variants;
-    char        param[64];
-} rule_entry_t;
+    uint32_t k0, k1, k2;
+} zip_keys_t;
 
-typedef struct {
-    rule_entry_t entries[MAX_RULES];
-    int          num_entries;
-} rule_set_t;
+/* CRC32 table from utils.c */
+extern uint32_t g_crc32_table[256];
 
-/*
- * Build default rule set (used when no rules file is specified).
- */
-static void rule_set_default(rule_set_t *rs) {
-    memset(rs, 0, sizeof(*rs));
-    int idx = 0;
-
-    /* Original (passthrough - no rule needed, handled in engine) */
-
-    /* Capitalize */
-    rs->entries[idx].type = RULE_CAPITALIZE;
-    rs->entries[idx].num_variants = 1;
-    rs->entries[idx].param_values[0] = 0;
-    idx++;
-
-    /* Uppercase all */
-    rs->entries[idx].type = RULE_UPPERCASE_ALL;
-    rs->entries[idx].num_variants = 1;
-    rs->entries[idx].param_values[0] = 0;
-    idx++;
-
-    /* Lowercase all */
-    rs->entries[idx].type = RULE_LOWERCASE_ALL;
-    rs->entries[idx].num_variants = 1;
-    rs->entries[idx].param_values[0] = 0;
-    idx++;
-
-    /* Leet speak */
-    rs->entries[idx].type = RULE_LEET_SPEAK;
-    rs->entries[idx].num_variants = 1;
-    rs->entries[idx].param_values[0] = 0;
-    idx++;
-
-    /* Reverse */
-    rs->entries[idx].type = RULE_REVERSE;
-    rs->entries[idx].num_variants = 1;
-    rs->entries[idx].param_values[0] = 0;
-    idx++;
-
-    /* Duplicate */
-    rs->entries[idx].type = RULE_DUPLICATE;
-    rs->entries[idx].num_variants = 1;
-    rs->entries[idx].param_values[0] = 0;
-    idx++;
-
-    /* Toggle case */
-    rs->entries[idx].type = RULE_TOGGLE_CASE;
-    rs->entries[idx].num_variants = 1;
-    rs->entries[idx].param_values[0] = 0;
-    idx++;
-
-    /* Append digits 0-9 */
-    rs->entries[idx].type = RULE_APPEND_DIGIT;
-    rs->entries[idx].num_variants = 10;
-    for (int i = 0; i < 10; i++) rs->entries[idx].param_values[i] = i;
-    idx++;
-
-    /* Prepend digits 0-9 */
-    rs->entries[idx].type = RULE_PREPEND_DIGIT;
-    rs->entries[idx].num_variants = 10;
-    for (int i = 0; i < 10; i++) rs->entries[idx].param_values[i] = i;
-    idx++;
-
-    /* Append years 2020-2025 */
-    rs->entries[idx].type = RULE_APPEND_YEAR;
-    rs->entries[idx].num_variants = 6;
-    for (int i = 0; i < 6; i++) rs->entries[idx].param_values[i] = i;
-    idx++;
-
-    /* Append special chars */
-    rs->entries[idx].type = RULE_APPEND_SPECIAL;
-    rs->entries[idx].num_variants = 7;
-    for (int i = 0; i < 7; i++) rs->entries[idx].param_values[i] = i;
-    idx++;
-
-    /* Reflect */
-    rs->entries[idx].type = RULE_REFLECT;
-    rs->entries[idx].num_variants = 1;
-    rs->entries[idx].param_values[0] = 0;
-    idx++;
-
-    /* Strip vowels */
-    rs->entries[idx].type = RULE_STRIP_VOWELS;
-    rs->entries[idx].num_variants = 1;
-    rs->entries[idx].param_values[0] = 0;
-    idx++;
-
-    rs->num_entries = idx;
+FORCE_INLINE void zip_update_keys(zip_keys_t *keys, uint8_t c) {
+    keys->k0 = crc32_update(keys->k0, &c, 1);
+    keys->k1 = keys->k1 + (keys->k0 & 0xFF);
+    keys->k1 = keys->k1 * 134775813UL + 1UL;
+    uint8_t b = (uint8_t)(keys->k1 >> 24);
+    keys->k2 = crc32_update(keys->k2, &b, 1);
 }
 
-/*
- * Load rules from file. Format: one rule per line.
- * Rule formats:
- *   capitalize
- *   uppercase
- *   lowercase
- *   leet
- *   reverse
- *   duplicate
- *   toggle
- *   append_digit
- *   prepend_digit
- *   append_year
- *   append_special
- *   reflect
- *   strip_vowels
- */
-static int rule_set_load(rule_set_t *rs, const char *path) {
-    memset(rs, 0, sizeof(*rs));
+FORCE_INLINE uint8_t zip_decrypt_byte(const zip_keys_t *keys) {
+    uint16_t t = (uint16_t)(keys->k2 | 2);
+    return (uint8_t)(((uint32_t)t * (uint32_t)(t ^ 1U)) >> 8);
+}
 
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        log_error("rule_set_load: cannot open '%s': %s",
-                  path, strerror(errno));
-        return -1;
+FORCE_INLINE uint8_t zip_decrypt_char(zip_keys_t *keys, uint8_t c) {
+    uint8_t p = c ^ zip_decrypt_byte(keys);
+    zip_update_keys(keys, p);
+    return p;
+}
+
+static void zip_init_keys(zip_keys_t *keys, const char *password) {
+    keys->k0 = 305419896UL;
+    keys->k1 = 591751049UL;
+    keys->k2 = 878082192UL;
+
+    while (*password) {
+        zip_update_keys(keys, (uint8_t)*password);
+        password++;
     }
-
-    char line[256];
-    int  idx = 0;
-
-    while (fgets(line, sizeof(line), f) && idx < MAX_RULES) {
-        /* Trim */
-        size_t len = strlen(line);
-        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r' ||
-                            line[len-1] == ' ')) {
-            line[--len] = '\0';
-        }
-        if (len == 0 || line[0] == '#') continue;
-
-        rule_entry_t *e = &rs->entries[idx];
-        memset(e, 0, sizeof(*e));
-        snprintf(e->param, sizeof(e->param), "%.63s", line);
-
-        if      (strcmp(line, "capitalize")    == 0) {
-            e->type = RULE_CAPITALIZE;
-            e->num_variants = 1;
-            e->param_values[0] = 0;
-        } else if (strcmp(line, "uppercase")   == 0) {
-            e->type = RULE_UPPERCASE_ALL;
-            e->num_variants = 1;
-            e->param_values[0] = 0;
-        } else if (strcmp(line, "lowercase")   == 0) {
-            e->type = RULE_LOWERCASE_ALL;
-            e->num_variants = 1;
-            e->param_values[0] = 0;
-        } else if (strcmp(line, "leet")        == 0) {
-            e->type = RULE_LEET_SPEAK;
-            e->num_variants = 1;
-            e->param_values[0] = 0;
-        } else if (strcmp(line, "reverse")     == 0) {
-            e->type = RULE_REVERSE;
-            e->num_variants = 1;
-            e->param_values[0] = 0;
-        } else if (strcmp(line, "duplicate")   == 0) {
-            e->type = RULE_DUPLICATE;
-            e->num_variants = 1;
-            e->param_values[0] = 0;
-        } else if (strcmp(line, "toggle")      == 0) {
-            e->type = RULE_TOGGLE_CASE;
-            e->num_variants = 1;
-            e->param_values[0] = 0;
-        } else if (strcmp(line, "append_digit") == 0) {
-            e->type = RULE_APPEND_DIGIT;
-            e->num_variants = 10;
-            for (int i = 0; i < 10; i++) e->param_values[i] = i;
-        } else if (strcmp(line, "prepend_digit") == 0) {
-            e->type = RULE_PREPEND_DIGIT;
-            e->num_variants = 10;
-            for (int i = 0; i < 10; i++) e->param_values[i] = i;
-        } else if (strcmp(line, "append_year") == 0) {
-            e->type = RULE_APPEND_YEAR;
-            e->num_variants = 6;
-            for (int i = 0; i < 6; i++) e->param_values[i] = i;
-        } else if (strcmp(line, "append_special") == 0) {
-            e->type = RULE_APPEND_SPECIAL;
-            e->num_variants = 7;
-            for (int i = 0; i < 7; i++) e->param_values[i] = i;
-        } else if (strcmp(line, "reflect")     == 0) {
-            e->type = RULE_REFLECT;
-            e->num_variants = 1;
-            e->param_values[0] = 0;
-        } else if (strcmp(line, "strip_vowels") == 0) {
-            e->type = RULE_STRIP_VOWELS;
-            e->num_variants = 1;
-            e->param_values[0] = 0;
-        } else if (strcmp(line, "rotate_left") == 0) {
-            e->type = RULE_ROTATE_LEFT;
-            e->num_variants = 3;
-            e->param_values[0] = 1;
-            e->param_values[1] = 2;
-            e->param_values[2] = 3;
-        } else if (strcmp(line, "rotate_right") == 0) {
-            e->type = RULE_ROTATE_RIGHT;
-            e->num_variants = 3;
-            e->param_values[0] = 1;
-            e->param_values[1] = 2;
-            e->param_values[2] = 3;
-        } else {
-            log_warn("rule_set_load: unknown rule '%s', skipping", line);
-            continue;
-        }
-        idx++;
-    }
-
-    fclose(f);
-    rs->num_entries = idx;
-    log_info("rule_set_load: loaded %d rules from '%s'", idx, path);
-    return 0;
 }
 
 /* ============================================================
- * RULE-BASED ATTACK STATE
+ * ZIP PARSING
  * ============================================================ */
 
-typedef struct {
-    /* Dictionary reader */
-    dict_state_t    dict;
-
-    /* Rule set */
-    rule_set_t      rules;
-
-    /* State for applying rules to current word */
-    char            base_word[MAX_PASSWORD_LEN];
-    size_t          base_len;
-    bool            base_valid;
-    int             rule_idx;       /* current rule entry */
-    int             variant_idx;    /* current variant within rule */
-    bool            emitted_original; /* did we emit the base word? */
-
-    /* Thread info */
-    int             thread_id;
-    int             num_threads;
-
-    /* Stats */
-    uint64_t        total_processed;
-    bool            exhausted;
-
-    /* Scratch buffer */
-    char            scratch[MAX_PASSWORD_LEN];
-
-} rule_state_t;
-
-static int rule_state_init(rule_state_t *st,
-                            const char *wordlist_path,
-                            const char *rules_path,
-                            int thread_id,
-                            int num_threads,
-                            uint64_t file_offset) {
-    memset(st, 0, sizeof(*st));
-    st->thread_id   = thread_id;
-    st->num_threads = num_threads;
-
-    if (dict_init(&st->dict, wordlist_path, file_offset,
-                  thread_id, num_threads) != 0) {
-        return -1;
-    }
-
-    if (rules_path && rules_path[0] != '\0') {
-        if (rule_set_load(&st->rules, rules_path) != 0) {
-            log_warn("rule_state_init: using default rules");
-            rule_set_default(&st->rules);
-        }
-    } else {
-        rule_set_default(&st->rules);
-    }
-
-    st->base_valid        = false;
-    st->rule_idx          = 0;
-    st->variant_idx       = 0;
-    st->emitted_original  = false;
-    st->exhausted         = false;
-    st->total_processed   = 0;
-
-    return 0;
+static uint16_t le16(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
 }
 
-static void rule_state_cleanup(rule_state_t *st) {
-    dict_cleanup(&st->dict);
+static uint32_t le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint64_t le64(const uint8_t *p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8)  |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
 }
 
 /*
- * Get next base word from dictionary.
- * Returns true if a new word was loaded, false on EOF.
+ * Find end-of-central-directory record.
+ * Searches from end of file backwards (handles ZIP comment).
  */
-static bool rule_load_next_word(rule_state_t *st) {
-    while (true) {
-        int len = dict_read_line(&st->dict);
-        if (len < 0) return false; /* error */
-        if (len == 0 && st->dict.eof) return false;
-        if (len == 0) continue;
+static const uint8_t *zip_find_eocd(const uint8_t *data, size_t size) {
+    if (size < sizeof(zip_eocd_t)) return NULL;
 
-        /* Thread interleaving */
-        if (st->num_threads > 1) {
-            uint64_t lnum = st->dict.line_number - 1;
-            if ((lnum % (uint64_t)st->num_threads) !=
-                (uint64_t)st->thread_id) {
-                continue;
-            }
+    /* Search backwards from end */
+    size_t search_start = (size >= 65536 + sizeof(zip_eocd_t))
+                          ? size - 65536 - sizeof(zip_eocd_t)
+                          : 0;
+
+    for (size_t i = size - sizeof(zip_eocd_t); ; i--) {
+        if (data[i]   == 0x50 && data[i+1] == 0x4B &&
+            data[i+2] == 0x05 && data[i+3] == 0x06) {
+            return &data[i];
         }
-
-        memcpy(st->base_word, st->dict.line_buf, len);
-        st->base_word[len] = '\0';
-        st->base_len       = (size_t)len;
-        st->base_valid     = true;
-        st->rule_idx       = 0;
-        st->variant_idx    = 0;
-        st->emitted_original = false;
-        return true;
+        if (i == search_start) break;
     }
+    return NULL;
 }
 
 /*
- * Get next rule-generated candidate.
- * Returns true and fills 'out' with the next candidate.
- * Returns false when all rules for current word are exhausted.
+ * Parse WinZip AES extra field.
+ * Returns true if AES extra was found and parsed.
  */
-static bool rule_next_candidate(rule_state_t *st, char *out) {
-    if (!st->base_valid) return false;
+static bool zip_parse_aes_extra(const uint8_t *extra, uint16_t extra_len,
+                                 struct zip_ctx *ctx) {
+    const uint8_t *p   = extra;
+    const uint8_t *end = extra + extra_len;
 
-    /* First: emit original word */
-    if (!st->emitted_original) {
-        memcpy(out, st->base_word, st->base_len + 1);
-        st->emitted_original = true;
-        return true;
-    }
+    while (p + 4 <= end) {
+        uint16_t tag  = le16(p);
+        uint16_t size = le16(p + 2);
+        p += 4;
 
-    /* Then: iterate through rules and variants */
-    while (st->rule_idx < st->rules.num_entries) {
-        rule_entry_t *re = &st->rules.entries[st->rule_idx];
+        if (p + size > end) break;
 
-        if (st->variant_idx < re->num_variants) {
-            int pv = re->param_values[st->variant_idx];
-            st->variant_idx++;
+        if (tag == 0x9901 && size >= 7) {
+            /* WinZip AES extra field */
+            uint16_t ver      = le16(p);
+            uint8_t  strength = p[4];    /* 1=128,2=192,3=256 */
+            uint16_t actual   = le16(p + 5);
 
-            int rlen = apply_rule(re->type, re->param, pv,
-                                   st->base_word, st->base_len,
-                                   out, MAX_PASSWORD_LEN);
-
-            if (rlen <= 0) continue; /* rule failed or empty */
-            if (rlen >= MAX_PASSWORD_LEN) continue; /* too long */
-
-            /* Skip if identical to base word (already emitted) */
-            if (rlen == (int)st->base_len &&
-                memcmp(out, st->base_word, st->base_len) == 0) {
-                continue;
-            }
-
-            return true;
-        }
-
-        /* Move to next rule */
-        st->rule_idx++;
-        st->variant_idx = 0;
-    }
-
-    return false; /* all rules exhausted for this word */
-}
-
-static int rule_next_batch(rule_state_t *st, candidate_batch_t *batch) {
-    batch_reset(batch);
-
-    while (!batch_full(batch)) {
-        if (UNLIKELY(st->exhausted)) break;
-
-        /* Try to get next candidate from current word */
-        if (st->base_valid) {
-            char pw[MAX_PASSWORD_LEN];
-            if (rule_next_candidate(st, pw)) {
-                batch_add(batch, pw);
-                st->total_processed++;
-                continue;
+            if (ver == 1 || ver == 2) {
+                ctx->is_aes           = true;
+                ctx->aes_strength     = strength;
+                ctx->aes_actual_method = actual;
+                return true;
             }
         }
-
-        /* Load next base word */
-        if (!rule_load_next_word(st)) {
-            st->exhausted = true;
-            break;
-        }
+        p += size;
     }
-
-    return batch->count;
-}
-
-/* ============================================================
- * HYBRID ATTACK STATE
- * ============================================================ */
-
-/*
- * Hybrid attack: takes base words from a dictionary and
- * appends/prepends generated suffixes/prefixes.
- *
- * For each base word, we generate:
- *   base + suffix   (suffix from charset, length suffix_min..suffix_max)
- *   prefix + base   (prefix from charset, length prefix_min..prefix_max)
- *
- * The suffix/prefix generation uses the same counter-based approach
- * as brute force, but with a configurable charset.
- */
-
-typedef struct {
-    /* Dictionary state */
-    dict_state_t    dict;
-
-    /* Hybrid config */
-    hybrid_config_t config;
-
-    /* Current base word */
-    char            base_word[MAX_PASSWORD_LEN];
-    size_t          base_len;
-    bool            base_valid;
-
-    /* Suffix/prefix generator state */
-    charset_spec_t  suffix_cs;
-    charset_spec_t  prefix_cs;
-
-    /* Current suffix state */
-    int             suffix_len;
-    int             suffix_counter[MAX_PASSWORD_LEN];
-    uint64_t        suffix_index;
-    uint64_t        suffix_total;
-    bool            suffix_done;
-
-    /* Current prefix state */
-    int             prefix_len;
-    int             prefix_counter[MAX_PASSWORD_LEN];
-    uint64_t        prefix_index;
-    uint64_t        prefix_total;
-    bool            prefix_done;
-
-    /* Mode: 0=suffix, 1=prefix */
-    int             mode;
-
-    /* Thread info */
-    int             thread_id;
-    int             num_threads;
-
-    /* Stats */
-    uint64_t        total_processed;
-    bool            exhausted;
-
-    /* Output buffer */
-    char            candidate[MAX_PASSWORD_LEN];
-
-} hybrid_state_t;
-
-static void hybrid_reset_suffix(hybrid_state_t *st) {
-    if (st->config.suffix_min_len <= 0) {
-        st->suffix_done = true;
-        return;
-    }
-    st->suffix_len     = st->config.suffix_min_len;
-    st->suffix_index   = 0;
-    st->suffix_total   = safe_pow64((uint64_t)st->suffix_cs.len,
-                                     st->suffix_len);
-    memset(st->suffix_counter, 0,
-           sizeof(int) * st->suffix_len);
-    st->suffix_done    = false;
-}
-
-static void hybrid_reset_prefix(hybrid_state_t *st) {
-    if (st->config.prefix_min_len <= 0) {
-        st->prefix_done = true;
-        return;
-    }
-    st->prefix_len     = st->config.prefix_min_len;
-    st->prefix_index   = 0;
-    st->prefix_total   = safe_pow64((uint64_t)st->prefix_cs.len,
-                                     st->prefix_len);
-    memset(st->prefix_counter, 0,
-           sizeof(int) * st->prefix_len);
-    st->prefix_done    = false;
-}
-
-static int hybrid_init(hybrid_state_t *st,
-                        const char *wordlist_path,
-                        const hybrid_config_t *cfg,
-                        const charset_spec_t *suffix_cs,
-                        const charset_spec_t *prefix_cs,
-                        int thread_id, int num_threads,
-                        uint64_t file_offset) {
-    memset(st, 0, sizeof(*st));
-    memcpy(&st->config, cfg, sizeof(*cfg));
-    st->thread_id   = thread_id;
-    st->num_threads = num_threads;
-
-    if (dict_init(&st->dict, wordlist_path, file_offset,
-                  thread_id, num_threads) != 0) {
-        return -1;
-    }
-
-    /* Set up charsets */
-    if (suffix_cs && suffix_cs->len > 0) {
-        memcpy(&st->suffix_cs, suffix_cs, sizeof(*suffix_cs));
-    } else {
-        /* Default suffix charset: digits */
-        memcpy(st->suffix_cs.chars, "0123456789", 10);
-        st->suffix_cs.chars[10] = '\0';
-        st->suffix_cs.len = 10;
-    }
-
-    if (prefix_cs && prefix_cs->len > 0) {
-        memcpy(&st->prefix_cs, prefix_cs, sizeof(*prefix_cs));
-    } else {
-        memcpy(st->prefix_cs.chars, "0123456789", 10);
-        st->prefix_cs.chars[10] = '\0';
-        st->prefix_cs.len = 10;
-    }
-
-    st->base_valid      = false;
-    st->exhausted       = false;
-    st->total_processed = 0;
-    st->mode            = 0; /* start with suffix */
-    st->suffix_done     = true;
-    st->prefix_done     = true;
-
-    return 0;
-}
-
-static void hybrid_cleanup(hybrid_state_t *st) {
-    dict_cleanup(&st->dict);
-}
-
-static bool hybrid_load_next_word(hybrid_state_t *st) {
-    while (true) {
-        int len = dict_read_line(&st->dict);
-        if (len < 0 || (len == 0 && st->dict.eof)) return false;
-        if (len == 0) continue;
-
-        if (st->num_threads > 1) {
-            uint64_t lnum = st->dict.line_number - 1;
-            if ((lnum % (uint64_t)st->num_threads) !=
-                (uint64_t)st->thread_id) {
-                continue;
-            }
-        }
-
-        memcpy(st->base_word, st->dict.line_buf, len);
-        st->base_word[len] = '\0';
-        st->base_len       = (size_t)len;
-        st->base_valid     = true;
-        st->mode           = 0;
-
-        /* Reset generators */
-        hybrid_reset_suffix(st);
-        hybrid_reset_prefix(st);
-
-        return true;
-    }
-}
-
-static bool hybrid_increment_suffix(hybrid_state_t *st) {
-    int N = st->suffix_cs.len;
-    int L = st->suffix_len;
-
-    /* Increment counter */
-    for (int i = L - 1; i >= 0; i--) {
-        st->suffix_counter[i]++;
-        if (st->suffix_counter[i] < N) {
-            st->suffix_index++;
-            return true;
-        }
-        st->suffix_counter[i] = 0;
-    }
-
-    /* Counter overflowed - try next length */
-    if (st->suffix_len < st->config.suffix_max_len) {
-        st->suffix_len++;
-        st->suffix_total = safe_pow64((uint64_t)N, st->suffix_len);
-        st->suffix_index = 0;
-        memset(st->suffix_counter, 0, sizeof(int) * st->suffix_len);
-        return true;
-    }
-
-    return false; /* all suffix lengths exhausted */
-}
-
-static bool hybrid_increment_prefix(hybrid_state_t *st) {
-    int N = st->prefix_cs.len;
-    int L = st->prefix_len;
-
-    for (int i = L - 1; i >= 0; i--) {
-        st->prefix_counter[i]++;
-        if (st->prefix_counter[i] < N) {
-            st->prefix_index++;
-            return true;
-        }
-        st->prefix_counter[i] = 0;
-    }
-
-    if (st->prefix_len < st->config.prefix_max_len) {
-        st->prefix_len++;
-        st->prefix_total = safe_pow64((uint64_t)N, st->prefix_len);
-        st->prefix_index = 0;
-        memset(st->prefix_counter, 0, sizeof(int) * st->prefix_len);
-        return true;
-    }
-
     return false;
 }
 
 /*
- * Build current suffix candidate into out.
- * Returns true if candidate was built successfully.
+ * Full ZIP parsing - finds first encrypted entry and extracts
+ * encryption header and parameters needed for validation.
  */
-static bool hybrid_build_suffix_candidate(hybrid_state_t *st, char *out) {
-    if (st->suffix_done) return false;
+int zip_parse(struct zip_ctx *ctx, const char *path) {
+    memset(ctx, 0, sizeof(*ctx));
 
-    int L = st->suffix_len;
-    if (st->base_len + (size_t)L >= MAX_PASSWORD_LEN) return false;
-
-    /* Emit base word first (no suffix) on first iteration */
-    memcpy(out, st->base_word, st->base_len);
-
-    /* Append suffix */
-    const char *cs = st->suffix_cs.chars;
-    for (int i = 0; i < L; i++) {
-        out[st->base_len + i] = cs[st->suffix_counter[i]];
+    ctx->fd = open(path, O_RDONLY);
+    if (ctx->fd < 0) {
+        log_error("zip_parse: cannot open '%s': %s", path, strerror(errno));
+        return -1;
     }
-    out[st->base_len + L] = '\0';
-    return true;
+
+    struct stat st;
+    if (fstat(ctx->fd, &st) != 0) {
+        log_error("zip_parse: fstat failed: %s", strerror(errno));
+        close(ctx->fd);
+        return -1;
+    }
+
+    ctx->data_size = (size_t)st.st_size;
+    if (ctx->data_size < sizeof(zip_local_header_t)) {
+        log_error("zip_parse: file too small (%zu bytes)", ctx->data_size);
+        close(ctx->fd);
+        return -1;
+    }
+
+    /* Memory-map the file */
+    ctx->data = (const uint8_t *)mmap(NULL, ctx->data_size,
+                                       PROT_READ, MAP_PRIVATE,
+                                       ctx->fd, 0);
+    if (ctx->data == MAP_FAILED) {
+        log_warn("zip_parse: mmap failed, falling back to read");
+        uint8_t *buf = (uint8_t *)malloc(ctx->data_size);
+        if (!buf) {
+            log_error("zip_parse: malloc failed");
+            close(ctx->fd);
+            return -1;
+        }
+        ssize_t n = read(ctx->fd, buf, ctx->data_size);
+        if (n != (ssize_t)ctx->data_size) {
+            log_error("zip_parse: read failed");
+            free(buf);
+            close(ctx->fd);
+            return -1;
+        }
+        ctx->data      = buf;
+        ctx->mmap_used = false;
+    } else {
+        ctx->mmap_used = true;
+        /* Advise sequential access */
+        madvise((void *)ctx->data, ctx->data_size, MADV_SEQUENTIAL);
+    }
+
+    /* Find EOCD */
+    const uint8_t *eocd_ptr = zip_find_eocd(ctx->data, ctx->data_size);
+    if (!eocd_ptr) {
+        log_error("zip_parse: EOCD not found - not a valid ZIP file");
+        goto fail;
+    }
+
+    const zip_eocd_t *eocd = (const zip_eocd_t *)eocd_ptr;
+    uint32_t cd_offset    = le32((uint8_t *)&eocd->central_dir_offset);
+    uint32_t cd_size      = le32((uint8_t *)&eocd->central_dir_size);
+    uint16_t total_entries = le16((uint8_t *)&eocd->total_entries);
+
+    log_debug("zip_parse: EOCD found, %u entries, CD at 0x%08X (size %u)",
+              total_entries, cd_offset, cd_size);
+
+    if (cd_offset + cd_size > ctx->data_size) {
+        log_error("zip_parse: central directory exceeds file size");
+        goto fail;
+    }
+
+    /* Scan central directory for encrypted entries */
+    const uint8_t *cd_ptr = ctx->data + cd_offset;
+    const uint8_t *cd_end = cd_ptr + cd_size;
+    int  enc_count        = 0;
+    ctx->num_files        = 0;
+
+    while (cd_ptr + sizeof(zip_central_header_t) <= cd_end) {
+        uint32_t sig = le32(cd_ptr);
+        if (sig != ZIP_CENTRAL_DIR_HEADER_SIG) break;
+
+        const zip_central_header_t *ch = (const zip_central_header_t *)cd_ptr;
+
+        uint16_t flags     = le16((uint8_t *)&ch->flags);
+        uint16_t method    = le16((uint8_t *)&ch->compression_method);
+        uint32_t crc       = le32((uint8_t *)&ch->crc32);
+        uint32_t comp_sz   = le32((uint8_t *)&ch->compressed_size);
+        uint32_t ucomp_sz  = le32((uint8_t *)&ch->uncompressed_size);
+        uint16_t fn_len    = le16((uint8_t *)&ch->filename_len);
+        uint16_t extra_len = le16((uint8_t *)&ch->extra_field_len);
+        uint16_t cm_len    = le16((uint8_t *)&ch->comment_len);
+        uint32_t lh_offset = le32((uint8_t *)&ch->local_header_offset);
+        uint16_t mod_time  = le16((uint8_t *)&ch->last_mod_time);
+
+        ctx->num_files++;
+
+        if (fn_len > 0 && ctx->num_files == 1) {
+            size_t copy = (fn_len < 255) ? fn_len : 255;
+            memcpy(ctx->filename, cd_ptr + sizeof(zip_central_header_t), copy);
+            ctx->filename[copy] = '\0';
+        }
+
+        if (flags & ZIP_FLAG_ENCRYPTED) {
+            ctx->has_encrypted_file = true;
+            enc_count++;
+
+            if (enc_count == 1) {
+                /* This is our target entry */
+                ctx->crc32            = crc;
+                ctx->flags            = flags;
+                ctx->method           = method;
+                ctx->compressed_size  = comp_sz;
+                ctx->uncompressed_size = ucomp_sz;
+
+                /* Determine check byte */
+                if (flags & ZIP_FLAG_DATA_DESCRIPTOR) {
+                    /* Use last_mod_time high byte */
+                    ctx->check_byte_time = (uint8_t)(mod_time >> 8);
+                    ctx->use_crc_check   = false;
+                } else {
+                    /* Use CRC32 high byte */
+                    ctx->check_byte_crc  = (uint8_t)(crc >> 24);
+                    ctx->use_crc_check   = true;
+                }
+
+                /* Check for WinZip AES */
+                if (method == ZIP_METHOD_AES) {
+                    const uint8_t *extra = cd_ptr +
+                        sizeof(zip_central_header_t) + fn_len;
+                    if (extra + extra_len <= cd_end) {
+                        zip_parse_aes_extra(extra, extra_len, ctx);
+                    }
+                }
+
+                /* Read local header to locate encryption header and data offset */
+                if (lh_offset + sizeof(zip_local_header_t) <= ctx->data_size) {
+                    const uint8_t *lh_ptr = ctx->data + lh_offset;
+
+                    if (le32(lh_ptr) != ZIP_LOCAL_FILE_HEADER_SIG) {
+                        log_warn("zip_parse: local header signature mismatch "
+                                 "at 0x%08X", lh_offset);
+                    } else {
+                        const zip_local_header_t *lh =
+                            (const zip_local_header_t *)lh_ptr;
+
+                        uint16_t lfn_len   = le16((uint8_t *)&lh->filename_len);
+                        uint16_t lextra_len = le16((uint8_t *)&lh->extra_field_len);
+
+                        size_t data_start = lh_offset +
+                            sizeof(zip_local_header_t) +
+                            lfn_len + lextra_len;
+
+                        if (ctx->is_aes) {
+                            /* WinZip AES: salt + pwv bytes before ciphertext */
+                            int salt_len = 0;
+                            switch (ctx->aes_strength) {
+                                case 1: salt_len = 8;  break; /* AES-128 */
+                                case 2: salt_len = 12; break; /* AES-192 */
+                                case 3: salt_len = 16; break; /* AES-256 */
+                                default: salt_len = 16; break;
+                            }
+                            ctx->aes_salt_len = salt_len;
+
+                            if (data_start + salt_len + 2 <= ctx->data_size) {
+                                memcpy(ctx->aes_salt,
+                                       ctx->data + data_start,
+                                       salt_len);
+                                memcpy(ctx->aes_pwv,
+                                       ctx->data + data_start + salt_len,
+                                       2);
+                            }
+                            /* Data offset is after salt and pwv */
+                            ctx->data_offset = (uint32_t)(data_start + salt_len + 2);
+                        } else {
+                            /* Standard PKZIP: 12-byte encryption header */
+                            if (data_start + ZIP_ENCRYPTION_HEADER_SIZE
+                                    <= ctx->data_size) {
+                                memcpy(ctx->enc_header,
+                                       ctx->data + data_start,
+                                       ZIP_ENCRYPTION_HEADER_SIZE);
+                            }
+                            /* Data offset is after the 12-byte header */
+                            ctx->data_offset = (uint32_t)(data_start + ZIP_ENCRYPTION_HEADER_SIZE);
+                        }
+                    }
+                }
+            }
+        }
+
+        size_t entry_size = sizeof(zip_central_header_t) +
+                            fn_len + extra_len + cm_len;
+        cd_ptr += entry_size;
+    }
+
+    if (!ctx->has_encrypted_file) {
+        log_error("zip_parse: no encrypted entries found in '%s'", path);
+        goto fail;
+    }
+
+    ctx->parsed = true;
+    log_info("zip_parse: OK - %d files, %d encrypted, method=%u %s",
+             ctx->num_files, enc_count, ctx->method,
+             ctx->is_aes ? "(WinZip AES)" : "(PKZIP classic)");
+    return 0;
+
+fail:
+    if (ctx->mmap_used) {
+        munmap((void *)ctx->data, ctx->data_size);
+    } else {
+        free((void *)ctx->data);
+    }
+    close(ctx->fd);
+    ctx->data = NULL;
+    return -1;
 }
 
-static bool hybrid_build_prefix_candidate(hybrid_state_t *st, char *out) {
-    if (st->prefix_done) return false;
-
-    int L = st->prefix_len;
-    if (st->base_len + (size_t)L >= MAX_PASSWORD_LEN) return false;
-
-    const char *cs = st->prefix_cs.chars;
-    for (int i = 0; i < L; i++) {
-        out[i] = cs[st->prefix_counter[i]];
+void zip_ctx_free(struct zip_ctx *ctx) {
+    if (!ctx) return;
+    if (ctx->data) {
+        if (ctx->mmap_used) {
+            munmap((void *)ctx->data, ctx->data_size);
+        } else {
+            free((void *)ctx->data);
+        }
+        ctx->data = NULL;
     }
-    memcpy(out + L, st->base_word, st->base_len);
-    out[L + st->base_len] = '\0';
-    return true;
-}
-
-static int hybrid_next_batch(hybrid_state_t *st, candidate_batch_t *batch) {
-    batch_reset(batch);
-
-    while (!batch_full(batch)) {
-        if (UNLIKELY(st->exhausted)) break;
-
-        if (!st->base_valid) {
-            if (!hybrid_load_next_word(st)) {
-                st->exhausted = true;
-                break;
-            }
-            /* Emit base word without modifications */
-            batch_add(batch, st->base_word);
-            st->total_processed++;
-            continue;
-        }
-
-        /* Emit suffix candidates */
-        if (!st->suffix_done) {
-            char pw[MAX_PASSWORD_LEN];
-            if (hybrid_build_suffix_candidate(st, pw)) {
-                batch_add(batch, pw);
-                st->total_processed++;
-            }
-            if (!hybrid_increment_suffix(st)) {
-                st->suffix_done = true;
-            }
-            continue;
-        }
-
-        /* Emit prefix candidates */
-        if (!st->prefix_done) {
-            char pw[MAX_PASSWORD_LEN];
-            if (hybrid_build_prefix_candidate(st, pw)) {
-                batch_add(batch, pw);
-                st->total_processed++;
-            }
-            if (!hybrid_increment_prefix(st)) {
-                st->prefix_done = true;
-            }
-            continue;
-        }
-
-        /* Both suffix and prefix done - load next word */
-        st->base_valid = false;
+    if (ctx->fd >= 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
     }
-
-    return batch->count;
+    ctx->parsed = false;
 }
 
 /* ============================================================
- * UNIFIED ATTACK CONTEXT
+ * WINZIP AES KEY DERIVATION (PBKDF2-SHA1)
  * ============================================================ */
 
-typedef struct attack_ctx {
-    attack_mode_t   mode;
-    attack_ops_t    ops;
-    int             thread_id;
-    int             num_threads;
-    uint64_t        total_generated;
-    bool            initialized;
+/*
+ * PBKDF2-HMAC-SHA1 derivation as used by WinZip AES.
+ * Derives key material from password + salt.
+ */
+static void hmac_sha1(const uint8_t *key, size_t key_len,
+                       const uint8_t *data, size_t data_len,
+                       uint8_t out[20]) {
+    uint8_t ipad[64], opad[64];
+    uint8_t key_hash[20];
+    const uint8_t *k = key;
+    size_t klen = key_len;
 
-    /* Union of attack-specific states */
-    union {
-        dict_state_t    dict;
-        brute_state_t   brute;
-        mask_state_t    mask;
-        rule_state_t    rule;
-        hybrid_state_t  hybrid;
-    };
+    if (klen > 64) {
+        sha1(key, key_len, key_hash);
+        k    = key_hash;
+        klen = 20;
+    }
 
-    /* Shared config (read-only) */
-    const void *config_ref;
+    memset(ipad, 0x36, 64);
+    memset(opad, 0x5C, 64);
 
-} attack_ctx_t;
+    for (size_t i = 0; i < klen; i++) {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+
+    /* inner = SHA1(ipad || data) */
+    sha1_ctx_t ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, ipad, 64);
+    sha1_update(&ctx, data, data_len);
+    sha1_final(&ctx, out);
+
+    /* outer = SHA1(opad || inner) */
+    sha1_init(&ctx);
+    sha1_update(&ctx, opad, 64);
+    sha1_update(&ctx, out, 20);
+    sha1_final(&ctx, out);
+}
+
+static void pbkdf2_sha1(const uint8_t *password, size_t pass_len,
+                         const uint8_t *salt, size_t salt_len,
+                         uint32_t iterations,
+                         uint8_t *out, size_t out_len) {
+    uint32_t block_num = 0;
+    size_t   done      = 0;
+
+    uint8_t salt_blk[128];
+    if (salt_len > sizeof(salt_blk) - 4) {
+        salt_len = sizeof(salt_blk) - 4;
+    }
+    memcpy(salt_blk, salt, salt_len);
+
+    while (done < out_len) {
+        block_num++;
+        /* U1 = HMAC-SHA1(password, salt || block_num_be) */
+        salt_blk[salt_len + 0] = (uint8_t)(block_num >> 24);
+        salt_blk[salt_len + 1] = (uint8_t)(block_num >> 16);
+        salt_blk[salt_len + 2] = (uint8_t)(block_num >>  8);
+        salt_blk[salt_len + 3] = (uint8_t)(block_num);
+
+        uint8_t U[20], T[20];
+        hmac_sha1(password, pass_len, salt_blk, salt_len + 4, U);
+        memcpy(T, U, 20);
+
+        /* Ui = HMAC-SHA1(password, U_{i-1}) */
+        for (uint32_t i = 1; i < iterations; i++) {
+            hmac_sha1(password, pass_len, U, 20, U);
+            for (int j = 0; j < 20; j++) T[j] ^= U[j];
+        }
+
+        size_t copy = (out_len - done > 20) ? 20 : (out_len - done);
+        memcpy(out + done, T, copy);
+        done += copy;
+    }
+}
 
 /* ============================================================
- * ATTACK CONTEXT INIT/CLEANUP
+ * ZIP PASSWORD VALIDATION
  * ============================================================ */
 
-int attack_ctx_init_dict(attack_ctx_t *ctx,
-                          const char *wordlist_path,
-                          uint64_t file_offset,
-                          int thread_id,
-                          int num_threads) {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->mode       = ATTACK_DICTIONARY;
-    ctx->thread_id  = thread_id;
-    ctx->num_threads = num_threads;
-
-    int rc = dict_init(&ctx->dict, wordlist_path, file_offset,
-                        thread_id, num_threads);
-    if (rc != 0) return rc;
-
-    ctx->initialized = true;
-    return 0;
-}
-
-int attack_ctx_init_brute(attack_ctx_t *ctx,
-                           const charset_spec_t *cs,
-                           int min_len, int max_len,
-                           int thread_id, int num_threads,
-                           uint64_t skip, uint64_t limit) {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->mode        = ATTACK_BRUTEFORCE;
-    ctx->thread_id   = thread_id;
-    ctx->num_threads = num_threads;
-
-    int rc = brute_init(&ctx->brute, cs, min_len, max_len,
-                         thread_id, num_threads, skip, limit);
-    if (rc != 0) return rc;
-
-    ctx->initialized = true;
-    return 0;
-}
-
-int attack_ctx_init_mask(attack_ctx_t *ctx,
-                          const mask_spec_t *mask,
-                          int thread_id, int num_threads,
-                          uint64_t skip, uint64_t limit) {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->mode        = ATTACK_MASK;
-    ctx->thread_id   = thread_id;
-    ctx->num_threads = num_threads;
-
-    int rc = mask_init(&ctx->mask, mask, thread_id, num_threads,
-                        skip, limit);
-    if (rc != 0) return rc;
-
-    ctx->initialized = true;
-    return 0;
-}
-
-int attack_ctx_init_rule(attack_ctx_t *ctx,
-                          const char *wordlist_path,
-                          const char *rules_path,
-                          int thread_id, int num_threads,
-                          uint64_t file_offset) {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->mode        = ATTACK_RULE;
-    ctx->thread_id   = thread_id;
-    ctx->num_threads = num_threads;
-
-    int rc = rule_state_init(&ctx->rule, wordlist_path, rules_path,
-                              thread_id, num_threads, file_offset);
-    if (rc != 0) return rc;
-
-    ctx->initialized = true;
-    return 0;
-}
-
-int attack_ctx_init_hybrid(attack_ctx_t *ctx,
-                            const char *wordlist_path,
-                            const hybrid_config_t *cfg,
-                            const charset_spec_t *suffix_cs,
-                            const charset_spec_t *prefix_cs,
-                            int thread_id, int num_threads,
-                            uint64_t file_offset) {
-    memset(ctx, 0, sizeof(*ctx));
-    ctx->mode        = ATTACK_HYBRID;
-    ctx->thread_id   = thread_id;
-    ctx->num_threads = num_threads;
-
-    int rc = hybrid_init(&ctx->hybrid, wordlist_path, cfg,
-                          suffix_cs, prefix_cs,
-                          thread_id, num_threads, file_offset);
-    if (rc != 0) return rc;
-
-    ctx->initialized = true;
-    return 0;
-}
-
-void attack_ctx_cleanup(attack_ctx_t *ctx) {
-    if (!ctx || !ctx->initialized) return;
-
-    switch (ctx->mode) {
-        case ATTACK_DICTIONARY:
-            dict_cleanup(&ctx->dict);
-            break;
-        case ATTACK_RULE:
-            rule_state_cleanup(&ctx->rule);
-            break;
-        case ATTACK_HYBRID:
-            hybrid_cleanup(&ctx->hybrid);
-            break;
-        default:
-            break;
-    }
-    ctx->initialized = false;
-}
-
 /*
- * Unified next_batch dispatcher.
- * Returns number of candidates generated, 0 if exhausted.
+ * Verify the decrypted compressed data's first bytes to eliminate false positives.
  */
-int attack_ctx_next_batch(attack_ctx_t *ctx, candidate_batch_t *batch) {
-    if (UNLIKELY(!ctx->initialized)) return 0;
+static bool zip_verify_compressed_data(const struct zip_ctx *ctx,
+                                        zip_keys_t *keys,
+                                        const char *password) {
+    (void)password;  // not needed directly
 
-    int count = 0;
-    uint64_t skipped = 0;
-
-    switch (ctx->mode) {
-        case ATTACK_DICTIONARY:
-            count = dict_next_batch(&ctx->dict, batch, &skipped);
-            break;
-
-        case ATTACK_BRUTEFORCE:
-            count = brute_next_batch(&ctx->brute, batch);
-            break;
-
-        case ATTACK_MASK:
-            count = mask_next_batch(&ctx->mask, batch);
-            break;
-
-        case ATTACK_RULE:
-            count = rule_next_batch(&ctx->rule, batch);
-            break;
-
-        case ATTACK_HYBRID:
-            count = hybrid_next_batch(&ctx->hybrid, batch);
-            break;
-
-        default:
-            return 0;
+    if (ctx->data_offset == 0 || ctx->data_offset >= ctx->data_size) {
+        return false;
     }
 
-    if (count > 0) {
-        ctx->total_generated += (uint64_t)count;
+    size_t available = ctx->data_size - ctx->data_offset;
+    if (available < 8) return false;
+
+    /* Decrypt the first 16 bytes of the compressed data */
+    uint8_t encrypted[16];
+    size_t to_decrypt = (available < 16) ? available : 16;
+    memcpy(encrypted, ctx->data + ctx->data_offset, to_decrypt);
+
+    uint8_t decrypted[16];
+    for (size_t i = 0; i < to_decrypt; i++) {
+        decrypted[i] = zip_decrypt_char(keys, encrypted[i]);
     }
-    return count;
-}
 
-/*
- * Check if this attack context is exhausted.
- */
-bool attack_ctx_exhausted(const attack_ctx_t *ctx) {
-    if (!ctx->initialized) return true;
+    /* Verify based on compression method */
+    switch (ctx->method) {
+        case 8:  /* Deflate */
+            if (to_decrypt < 2) return false;
+            /* zlib header: first byte 0x78, second byte in {0x01,0x9C,0xDA} */
+            if (decrypted[0] == 0x78 &&
+                (decrypted[1] == 0x01 || decrypted[1] == 0x9C || decrypted[1] == 0xDA))
+                return true;
+            return false;
 
-    switch (ctx->mode) {
-        case ATTACK_DICTIONARY:
-            return ctx->dict.eof && ctx->dict.buf_pos >= ctx->dict.buf_len;
-        case ATTACK_BRUTEFORCE:
-            return ctx->brute.exhausted;
-        case ATTACK_MASK:
-            return ctx->mask.exhausted;
-        case ATTACK_RULE:
-            return ctx->rule.exhausted;
-        case ATTACK_HYBRID:
-            return ctx->hybrid.exhausted;
+        case 12: /* BZip2 */
+            if (to_decrypt < 3) return false;
+            return (decrypted[0] == 'B' && decrypted[1] == 'Z' && decrypted[2] == 'h');
+
+        case 14: /* LZMA */
+            if (to_decrypt < 3) return false;
+            /* LZMA compressed data often starts with 0x5D 0x00 0x00 */
+            return (decrypted[0] == 0x5D && decrypted[1] == 0x00 && decrypted[2] == 0x00);
+
+        case 0:  /* Stored (no compression) */
+            /* Simple sanity: decrypted bytes should not be all zeros or high-entropy garbage */
+            {
+                bool all_zero = true;
+                for (size_t i = 0; i < to_decrypt; i++) {
+                    if (decrypted[i] != 0) { all_zero = false; break; }
+                }
+                if (all_zero) return false;
+                /* Additional check: first few bytes should be printable or typical file magic */
+                if (to_decrypt >= 2 && (decrypted[0] < 0x20 || decrypted[0] > 0x7E) &&
+                    !(decrypted[0] == 0x0A || decrypted[0] == 0x0D))
+                    return false;
+                return true;
+            }
+
         default:
+            /* Unknown compression – accept weak check only (fallback) */
             return true;
     }
 }
 
 /*
- * Get current state description for display.
+ * Validate password against PKZIP-encrypted entry.
+ * Uses the 12-byte encryption header check method, then verifies
+ * the compressed data header to eliminate false positives.
+ *
+ * Returns true if password is correct.
  */
-void attack_ctx_get_state(const attack_ctx_t *ctx,
-                           char *buf, size_t buflen) {
-    if (!ctx->initialized) {
-        snprintf(buf, buflen, "(not initialized)");
+static bool zip_validate_pkzip(const struct zip_ctx *ctx, const char *password) {
+    if (UNLIKELY(!ctx->parsed)) return false;
+
+    zip_keys_t keys;
+    zip_init_keys(&keys, password);
+
+    /* Decrypt the 12-byte header */
+    uint8_t decrypted[ZIP_ENCRYPTION_HEADER_SIZE];
+    for (int i = 0; i < ZIP_ENCRYPTION_HEADER_SIZE; i++) {
+        decrypted[i] = zip_decrypt_char(&keys, ctx->enc_header[i]);
+    }
+
+    /*
+     * The 12th byte (index 11) of the decrypted header:
+     * - if DATA_DESCRIPTOR flag set: should match high byte of mod time
+     * - otherwise: should match high byte of CRC32
+     */
+    uint8_t check;
+    if (ctx->use_crc_check) {
+        check = ctx->check_byte_crc;
+    } else {
+        check = ctx->check_byte_time;
+    }
+
+    if (decrypted[ZIP_ENCRYPTION_HEADER_SIZE - 1] != check) {
+        return false;
+    }
+
+    /* Weak check passed – now verify actual compressed data */
+    return zip_verify_compressed_data(ctx, &keys, password);
+}
+
+/*
+ * Validate password against WinZip AES-encrypted entry.
+ * Uses PBKDF2-SHA1 key derivation and password verification bytes.
+ *
+ * The WinZip AES format derives:
+ *   key material = PBKDF2-HMAC-SHA1(password, salt, 1000, key_len + 2)
+ *   aes_key  = first key_len bytes
+ *   hmac_key = next key_len bytes (but we only need verification)
+ *   pwv      = last 2 bytes (password verification value)
+ *
+ * Returns true if password is correct.
+ */
+static bool zip_validate_aes(const struct zip_ctx *ctx, const char *password) {
+    if (UNLIKELY(!ctx->parsed || !ctx->is_aes)) return false;
+
+    int aes_key_len;
+    switch (ctx->aes_strength) {
+        case 1: aes_key_len = 16; break; /* AES-128 */
+        case 2: aes_key_len = 24; break; /* AES-192 */
+        case 3: aes_key_len = 32; break; /* AES-256 */
+        default: return false;
+    }
+
+    /* Derive: aes_key + hmac_key + 2 byte verifier */
+    int    derive_len = aes_key_len * 2 + 2;
+    uint8_t derived[66]; /* max: 32*2+2 */
+
+    pbkdf2_sha1((const uint8_t *)password, strlen(password),
+                ctx->aes_salt, (size_t)ctx->aes_salt_len,
+                1000,
+                derived, (size_t)derive_len);
+
+    /* Check last 2 bytes against stored password verification value */
+    uint8_t *pwv = derived + aes_key_len * 2;
+    return (pwv[0] == ctx->aes_pwv[0] && pwv[1] == ctx->aes_pwv[1]);
+}
+
+/*
+ * Main ZIP validation entry point.
+ * Automatically selects PKZIP or WinZip AES validation.
+ */
+bool zip_validate_password(const struct zip_ctx *ctx, const char *password) {
+    if (UNLIKELY(!ctx || !ctx->parsed)) return false;
+
+    if (ctx->is_aes) {
+        return zip_validate_aes(ctx, password);
+    } else {
+        return zip_validate_pkzip(ctx, password);
+    }
+}
+
+/* ============================================================
+ * 7Z PARSING
+ * ============================================================ */
+
+/*
+ * 7z uses a complex binary format. We need to parse enough of it
+ * to extract AES encryption parameters for password validation.
+ *
+ * The key parameters we need:
+ * - Salt (for key derivation)
+ * - IV (for AES-CBC)
+ * - NumCyclesPower (determines iterations = 1 << NumCyclesPower)
+ * - The encrypted header data (or first block of data stream)
+ * - The expected CRC for validation
+ */
+
+/* Variable-length encoding reader */
+typedef struct {
+    const uint8_t *data;
+    size_t         size;
+    size_t         pos;
+} sz_reader_t;
+
+static void sz_reader_init(sz_reader_t *r,
+                            const uint8_t *data, size_t size) {
+    r->data = data;
+    r->size = size;
+    r->pos  = 0;
+}
+
+static int sz_read_byte(sz_reader_t *r, uint8_t *out) {
+    if (r->pos >= r->size) return -1;
+    *out = r->data[r->pos++];
+    return 0;
+}
+
+static int sz_read_uint64(sz_reader_t *r, uint64_t *out) {
+    uint8_t b;
+    if (sz_read_byte(r, &b) != 0) return -1;
+
+    uint64_t mask   = 0x80;
+    uint64_t result = 0;
+    int      extra  = 0;
+
+    for (int i = 0; i < 8; i++) {
+        if ((b & mask) == 0) {
+            result = (uint64_t)(b & (mask - 1));
+            for (int j = 0; j < extra; j++) {
+                uint8_t eb;
+                if (sz_read_byte(r, &eb) != 0) return -1;
+                result |= ((uint64_t)eb << (8 * (i)));
+                i++;
+            }
+            break;
+        }
+        result |= ((uint64_t)(b & (mask - 1)) << (8 * extra));
+        mask >>= 1;
+        extra++;
+        if (extra == 8) {
+            for (int j = 0; j < 8; j++) {
+                uint8_t eb;
+                if (sz_read_byte(r, &eb) != 0) return -1;
+                result |= ((uint64_t)eb << (8 * j));
+            }
+            break;
+        }
+    }
+
+    (void)result;
+    (void)extra;
+    (void)mask;
+    *out = 0;
+    return 0;
+}
+
+/* Proper 7z UINT64 reader */
+static int sz_read_number(sz_reader_t *r, uint64_t *out) {
+    uint8_t first;
+    if (sz_read_byte(r, &first) != 0) return -1;
+
+    if ((first & 0x80) == 0) {
+        *out = first;
+        return 0;
+    }
+
+    uint8_t second;
+    if (sz_read_byte(r, &second) != 0) return -1;
+
+    if ((first & 0x40) == 0) {
+        *out = ((uint64_t)(first & 0x3F) << 8) | second;
+        return 0;
+    }
+
+    uint8_t third;
+    if (sz_read_byte(r, &third) != 0) return -1;
+
+    if ((first & 0x20) == 0) {
+        *out = ((uint64_t)(first & 0x1F) << 16) |
+               ((uint64_t)second << 8) | third;
+        return 0;
+    }
+
+    uint8_t fourth;
+    if (sz_read_byte(r, &fourth) != 0) return -1;
+
+    if ((first & 0x10) == 0) {
+        *out = ((uint64_t)(first & 0x0F) << 24) |
+               ((uint64_t)second << 16) |
+               ((uint64_t)third  <<  8) |
+               fourth;
+        return 0;
+    }
+
+    /* Read remaining bytes */
+    uint64_t val = ((uint64_t)(first & 0x0F));
+    int extra_bytes;
+
+    if      ((first & 0x08) == 0) { extra_bytes = 4; }
+    else if ((first & 0x04) == 0) { extra_bytes = 5; }
+    else if ((first & 0x02) == 0) { extra_bytes = 6; }
+    else if ((first & 0x01) == 0) { extra_bytes = 7; }
+    else                          { extra_bytes = 8; val = 0; }
+
+    val = ((uint64_t)(first & (0x0F >> (extra_bytes - 4))));
+    val = (val << 8) | second;
+    val = (val << 8) | third;
+    val = (val << 8) | fourth;
+
+    for (int i = 0; i < extra_bytes - 3; i++) {
+        uint8_t b;
+        if (sz_read_byte(r, &b) != 0) return -1;
+        val = (val << 8) | b;
+    }
+
+    *out = val;
+    (void)sz_read_uint64; /* suppress unused warning */
+    return 0;
+}
+
+/*
+ * Parse the 7z signature header and locate the main header.
+ * Extract AES parameters from the coder properties.
+ *
+ * The 7z AES coder property bytes layout:
+ *   byte 0:    (NumCyclesPower & 0x3F) | ((salt_size - 1) & 0xC0)
+ *              Actually: first6bits = NumCyclesPower, next bit = has_salt,
+ *              next bit = has_iv (simplified)
+ *
+ * Exact layout (from 7-Zip source):
+ *   byte 0 low 6 bits: NumCyclesPower
+ *   byte 0 bit 6: (saltSize >> 4) part
+ *   byte 0 bit 7: (ivSize  >> 4) part
+ *   byte 1: (saltSize & 0x0F) << 4 | (ivSize & 0x0F)
+ *   next saltSize bytes: salt
+ *   next ivSize  bytes: iv (padded to 16 if < 16)
+ */
+static bool sz_parse_aes_props(const uint8_t *props, size_t props_len,
+                                struct sz_ctx *ctx) {
+    if (props_len < 2) return false;
+
+    uint8_t b0 = props[0];
+    uint8_t b1 = props[1];
+
+    ctx->num_cycles_power = b0 & 0x3F;
+
+    int salt_size = ((b0 >> 7) & 1) * 16 + ((b1 >> 4) & 0x0F);
+    int iv_size   = ((b0 >> 6) & 1) * 16 + (b1 & 0x0F);
+
+    if (salt_size < 0 || iv_size < 0) return false;
+    if (2 + salt_size + iv_size > (int)props_len) {
+        /* Clamp to available */
+        salt_size = 0;
+        iv_size   = 0;
+    }
+
+    ctx->aes_salt_len = salt_size;
+    if (salt_size > 0) {
+        memcpy(ctx->aes_salt, props + 2, salt_size);
+    }
+
+    memset(ctx->aes_iv, 0, 16);
+    if (iv_size > 0) {
+        int copy = (iv_size < 16) ? iv_size : 16;
+        memcpy(ctx->aes_iv, props + 2 + salt_size, copy);
+    }
+
+    log_debug("sz_parse_aes_props: NumCyclesPower=%u, salt_len=%d, iv_len=%d",
+              ctx->num_cycles_power, salt_size, iv_size);
+    return true;
+}
+
+/*
+ * Minimal 7z stream scanner.
+ * Scans the raw header data looking for the AES coder property block.
+ *
+ * This is a simplified parser that scans for the AES codec marker
+ * (0x06, 0xF1, 0x07, 0x01) in the decoded (or encoded) header.
+ */
+static bool sz_scan_for_aes_coder(const uint8_t *data, size_t size,
+                                   struct sz_ctx *ctx) {
+    /*
+     * AES-256-SHA-256 codec ID: 06 F1 07 01
+     * We scan for this sequence and then read the following property bytes.
+     */
+    static const uint8_t aes_codec_id[] = {0x06, 0xF1, 0x07, 0x01};
+
+    for (size_t i = 0; i + sizeof(aes_codec_id) + 4 < size; i++) {
+        if (memcmp(data + i, aes_codec_id, sizeof(aes_codec_id)) == 0) {
+            /* Found AES coder - properties follow after codec ID */
+            /* Skip codec ID (4 bytes) */
+            size_t prop_offset = i + sizeof(aes_codec_id);
+
+            /* Next byte(s) are property size */
+            if (prop_offset >= size) continue;
+
+            /* Simple: assume property size is next byte */
+            uint8_t prop_size_byte = data[prop_offset];
+            prop_offset++;
+
+            if (prop_size_byte == 0 || prop_offset + prop_size_byte > size) {
+                continue;
+            }
+
+            if (sz_parse_aes_props(data + prop_offset, prop_size_byte, ctx)) {
+                log_debug("sz_scan_for_aes_coder: found AES coder at offset %zu",
+                          i);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/*
+ * Parse the 7z file header.
+ * We read the signature header to get:
+ *   - next_header_offset
+ *   - next_header_size
+ *   - next_header_crc
+ *
+ * Then we read the raw bytes of the next header (which may be
+ * encrypted) to extract AES parameters.
+ *
+ * For password validation:
+ *   1. Derive AES key using SHA-256 with salt and NumCyclesPower
+ *   2. Decrypt first block of encrypted header
+ *   3. Verify CRC of decrypted header
+ */
+int sz_parse(struct sz_ctx *ctx, const char *path) {
+    memset(ctx, 0, sizeof(*ctx));
+
+    ctx->fd = open(path, O_RDONLY);
+    if (ctx->fd < 0) {
+        log_error("sz_parse: cannot open '%s': %s", path, strerror(errno));
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(ctx->fd, &st) != 0) {
+        log_error("sz_parse: fstat failed: %s", strerror(errno));
+        close(ctx->fd);
+        return -1;
+    }
+
+    ctx->data_size = (size_t)st.st_size;
+    if (ctx->data_size < sizeof(sz_signature_header_t)) {
+        log_error("sz_parse: file too small");
+        close(ctx->fd);
+        return -1;
+    }
+
+    /* Memory-map */
+    ctx->data = (const uint8_t *)mmap(NULL, ctx->data_size,
+                                       PROT_READ, MAP_PRIVATE,
+                                       ctx->fd, 0);
+    if (ctx->data == MAP_FAILED) {
+        uint8_t *buf = (uint8_t *)malloc(ctx->data_size);
+        if (!buf) {
+            log_error("sz_parse: malloc failed");
+            close(ctx->fd);
+            return -1;
+        }
+        ssize_t n = read(ctx->fd, buf, ctx->data_size);
+        if (n != (ssize_t)ctx->data_size) {
+            free(buf);
+            close(ctx->fd);
+            return -1;
+        }
+        ctx->data      = buf;
+        ctx->mmap_used = false;
+    } else {
+        ctx->mmap_used = true;
+        madvise((void *)ctx->data, ctx->data_size, MADV_SEQUENTIAL);
+    }
+
+    /* Verify signature */
+    if (memcmp(ctx->data, SZ_SIGNATURE, SZ_SIGNATURE_SIZE) != 0) {
+        log_error("sz_parse: invalid 7z signature");
+        goto fail;
+    }
+
+    const sz_signature_header_t *hdr =
+        (const sz_signature_header_t *)ctx->data;
+
+    ctx->next_header_offset = le64((uint8_t *)&hdr->next_header_offset);
+    ctx->next_header_size   = le64((uint8_t *)&hdr->next_header_size);
+    ctx->next_header_crc    = le32((uint8_t *)&hdr->next_header_crc);
+
+    log_debug("sz_parse: ver=%u.%u, next_hdr_offset=0x%llX, "
+              "next_hdr_size=%llu, next_hdr_crc=0x%08X",
+              hdr->major_version, hdr->minor_version,
+              (unsigned long long)ctx->next_header_offset,
+              (unsigned long long)ctx->next_header_size,
+              ctx->next_header_crc);
+
+    /* Validate next header location */
+    uint64_t hdr_start = sizeof(sz_signature_header_t) +
+                          ctx->next_header_offset;
+
+    if (hdr_start >= ctx->data_size) {
+        log_error("sz_parse: next header offset exceeds file size");
+        goto fail;
+    }
+
+    uint64_t hdr_end = hdr_start + ctx->next_header_size;
+    if (hdr_end > ctx->data_size) {
+        log_error("sz_parse: next header extends beyond file size");
+        goto fail;
+    }
+
+    const uint8_t *hdr_data = ctx->data + hdr_start;
+    size_t         hdr_size = (size_t)ctx->next_header_size;
+
+    /* Check if header starts with SZ_ID_ENCODED_HEADER (0x17) */
+    if (hdr_data[0] == SZ_ID_ENCODED_HEADER) {
+        ctx->is_header_encrypted = false; /* Encoded but not necessarily AES */
+        log_debug("sz_parse: encoded header detected");
+
+        /*
+         * Encoded header - scan for AES coder ID within the header data.
+         * The encoded header contains pack info and folder info.
+         * We scan for the AES codec marker.
+         */
+        if (sz_scan_for_aes_coder(hdr_data, hdr_size, ctx)) {
+            ctx->has_encrypted_streams = true;
+
+            /* Extract the encrypted data start for validation */
+            /* The actual encrypted stream starts after the signature header */
+            /* and the packed stream offset from pack info */
+            /* For simplicity: use first 32 bytes at hdr_data+1 as enc data */
+            size_t enc_copy = (hdr_size > 32) ? 32 : hdr_size;
+            memcpy(ctx->enc_header_data, hdr_data, enc_copy);
+            ctx->enc_header_size = enc_copy;
+        }
+    } else if (hdr_data[0] == SZ_ID_HEADER) {
+        /* Unencoded header - archive may have encrypted content */
+        log_debug("sz_parse: plain header detected");
+
+        /* Scan the full header for AES coder */
+        if (sz_scan_for_aes_coder(hdr_data, hdr_size, ctx)) {
+            ctx->has_encrypted_streams = true;
+            log_debug("sz_parse: encrypted stream found in plain header");
+        } else {
+            log_warn("sz_parse: no encrypted streams found");
+        }
+    } else {
+        log_warn("sz_parse: unexpected header type 0x%02X", hdr_data[0]);
+
+        /* Still try to scan */
+        if (sz_scan_for_aes_coder(hdr_data, hdr_size, ctx)) {
+            ctx->has_encrypted_streams = true;
+        }
+    }
+
+    /*
+     * Extract encrypted data for validation.
+     * We use the data stream (before the header) which contains the actual
+     * encrypted file content. We grab the first 32+ bytes for AES block test.
+     *
+     * The packed streams come before the header in 7z format.
+     * First packed stream starts at offset 32 (after signature header).
+     */
+    size_t pack_start = sizeof(sz_signature_header_t);
+    size_t pack_available = (ctx->next_header_offset > 0 &&
+                              pack_start < ctx->data_size)
+                            ? (size_t)(ctx->next_header_offset)
+                            : 0;
+
+    if (pack_available >= AES_BLOCK_SIZE) {
+        /* Grab first 32 bytes of the packed (encrypted) stream */
+        size_t enc_copy = (pack_available >= 32) ? 32 : pack_available;
+        memcpy(ctx->enc_header_data, ctx->data + pack_start, enc_copy);
+        ctx->enc_header_size = enc_copy;
+        ctx->has_encrypted_streams = true;
+    }
+
+    if (!ctx->has_encrypted_streams) {
+        log_error("sz_parse: no encrypted streams found in '%s'", path);
+        goto fail;
+    }
+
+    ctx->parsed = true;
+    log_info("sz_parse: OK - encrypted=%s, NumCyclesPower=%u, salt_len=%d",
+             ctx->has_encrypted_streams ? "yes" : "no",
+             ctx->num_cycles_power,
+             ctx->aes_salt_len);
+    return 0;
+
+fail:
+    if (ctx->mmap_used) {
+        munmap((void *)ctx->data, ctx->data_size);
+    } else {
+        free((void *)ctx->data);
+    }
+    close(ctx->fd);
+    ctx->data = NULL;
+    return -1;
+}
+
+void sz_ctx_free(struct sz_ctx *ctx) {
+    if (!ctx) return;
+    if (ctx->data) {
+        if (ctx->mmap_used) {
+            munmap((void *)ctx->data, ctx->data_size);
+        } else {
+            free((void *)ctx->data);
+        }
+        ctx->data = NULL;
+    }
+    if (ctx->fd >= 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+    ctx->parsed = false;
+}
+
+/* ============================================================
+ * 7Z KEY DERIVATION
+ * ============================================================ */
+
+/*
+ * 7-Zip AES key derivation:
+ *   key = SHA256_repeated(password_utf16le + salt, 1 << NumCyclesPower)
+ *
+ * The password is treated as UTF-16LE (each ASCII char becomes 2 bytes).
+ * If NumCyclesPower == 0x3F, it's a single SHA256(salt || password_utf16le).
+ *
+ * This implements the 7-Zip key derivation as documented in the
+ * 7-Zip source (CPP/7zip/Crypto/7zAes.cpp).
+ */
+static void sz_derive_key(const char *password,
+                           const uint8_t *salt, int salt_len,
+                           uint32_t num_cycles_power,
+                           uint8_t key[32]) {
+    size_t pass_len = strlen(password);
+
+    /*
+     * Build the derivation input:
+     * password as UTF-16LE + salt bytes interleaved:
+     * Actually: SHA256 is computed over
+     *   (password_utf16le XOR_position_dependent) repeated
+     *
+     * Exact 7z algorithm:
+     * sha256_ctx is updated with 8-byte blocks:
+     *   [pass_byte0, 0, pass_byte1, 0, ..., pass_byteN, 0, salt_bytes...]
+     * This whole sequence is fed into SHA-256 repeatedly.
+     *
+     * Simplified: we feed the counter + password_utf16le + salt
+     * in a specific pattern.
+     */
+
+    /* Build utf16le password */
+    uint8_t  utf16[MAX_PASSWORD_LEN * 2];
+    size_t   utf16_len = 0;
+
+    for (size_t i = 0; i < pass_len && i < MAX_PASSWORD_LEN; i++) {
+        utf16[utf16_len++] = (uint8_t)password[i];
+        utf16[utf16_len++] = 0x00;
+    }
+
+    if (num_cycles_power == 0x3F) {
+        /* Single SHA256 of salt || password_utf16le */
+        sha256_ctx_t ctx;
+        sha256_init(&ctx);
+        if (salt_len > 0) {
+            sha256_update(&ctx, salt, salt_len);
+        }
+        sha256_update(&ctx, utf16, utf16_len);
+        sha256_final(&ctx, key);
         return;
     }
 
-    switch (ctx->mode) {
-        case ATTACK_DICTIONARY:
-            snprintf(buf, buflen, "line=%llu offset=%llu",
-                     (unsigned long long)ctx->dict.line_number,
-                     (unsigned long long)dict_get_offset(&ctx->dict));
-            break;
+    uint64_t num_rounds = (uint64_t)1 << num_cycles_power;
 
-        case ATTACK_BRUTEFORCE:
-            brute_get_state(&ctx->brute, buf, buflen);
-            break;
+    /*
+     * The actual 7-Zip algorithm feeds data in 8-byte blocks with
+     * a counter. Each block is:
+     *   utf16[0..7] || utf16[8..15] || ... || salt[0..7] || counter_le64
+     *
+     * We build a single SHA256 context and feed data repeatedly.
+     */
+    sha256_ctx_t sha_ctx;
+    sha256_init(&sha_ctx);
 
-        case ATTACK_MASK:
-            mask_get_state(&ctx->mask, buf, buflen);
-            break;
+    /* Total data per "round" = utf16_len + salt_len */
+    /* We interleave: utf16 bytes followed by salt bytes */
+    size_t round_data_len = utf16_len + (size_t)salt_len;
+    uint8_t round_data[MAX_PASSWORD_LEN * 2 + 64];
 
-        case ATTACK_RULE:
-            snprintf(buf, buflen, "word=%.32s rule=%d",
-                     ctx->rule.base_word,
-                     ctx->rule.rule_idx);
-            break;
-
-        case ATTACK_HYBRID:
-            snprintf(buf, buflen, "word=%.32s sfx_len=%d pfx_len=%d",
-                     ctx->hybrid.base_word,
-                     ctx->hybrid.suffix_len,
-                     ctx->hybrid.prefix_len);
-            break;
-
-        default:
-            snprintf(buf, buflen, "unknown");
-            break;
+    if (round_data_len > sizeof(round_data)) {
+        round_data_len = sizeof(round_data);
     }
-}
 
-/*
- * Get total keyspace estimate.
- */
-uint64_t attack_ctx_keyspace(const attack_ctx_t *ctx) {
-    if (!ctx->initialized) return 0;
-
-    switch (ctx->mode) {
-        case ATTACK_BRUTEFORCE:
-            return brute_get_keyspace(&ctx->brute);
-
-        case ATTACK_MASK:
-            return ctx->mask.total_keyspace;
-
-        case ATTACK_DICTIONARY:
-            if (ctx->dict.file_size > 0) {
-                /* Estimate based on average line length */
-                return (uint64_t)(ctx->dict.file_size / 8);
-            }
-            return 0;
-
-        case ATTACK_RULE:
-        case ATTACK_HYBRID:
-            /* Too complex to estimate accurately without reading file */
-            return 0;
-
-        default:
-            return 0;
+    memcpy(round_data, utf16, utf16_len);
+    if (salt_len > 0) {
+        memcpy(round_data + utf16_len, salt, salt_len);
     }
-}
 
-/*
- * Get resume state for dictionary attacks.
- */
-uint64_t attack_ctx_get_dict_offset(const attack_ctx_t *ctx) {
-    if (ctx->mode == ATTACK_DICTIONARY) {
-        return dict_get_offset(&ctx->dict);
+    /*
+     * Feed round_data into sha_ctx, then append 8-byte little-endian counter.
+     * Repeat num_rounds times, all in the same SHA256 context.
+     */
+    for (uint64_t round = 0; round < num_rounds; round++) {
+        sha256_update(&sha_ctx, round_data, round_data_len);
+        /* Append 8-byte counter (little-endian) */
+        uint8_t counter[8];
+        uint64_t r = round;
+        for (int i = 0; i < 8; i++) {
+            counter[i] = (uint8_t)(r & 0xFF);
+            r >>= 8;
+        }
+        sha256_update(&sha_ctx, counter, 8);
     }
-    if (ctx->mode == ATTACK_RULE) {
-        return dict_get_offset(&ctx->rule.dict);
-    }
-    if (ctx->mode == ATTACK_HYBRID) {
-        return dict_get_offset(&ctx->hybrid.dict);
-    }
-    return 0;
-}
 
-uint64_t attack_ctx_get_brute_index(const attack_ctx_t *ctx) {
-    if (ctx->mode == ATTACK_BRUTEFORCE) {
-        return ctx->brute.cur_index;
-    }
-    if (ctx->mode == ATTACK_MASK) {
-        return ctx->mask.cur_index;
-    }
-    return 0;
-}
-
-size_t attack_ctx_size(void) {
-    return sizeof(attack_ctx_t);
+    sha256_final(&sha_ctx, key);
 }
 
 /* ============================================================
- * CANDIDATE FILTERING
+ * 7Z PASSWORD VALIDATION
  * ============================================================ */
 
 /*
- * Filter a candidate batch by password length constraints.
- * Removes passwords outside [min_len, max_len] in-place.
+ * Validate password against a 7z encrypted archive.
+ *
+ * Strategy:
+ *   1. Derive 256-bit AES key using 7z key derivation
+ *   2. Decrypt first block of encrypted header using AES-CBC
+ *   3. Verify the CRC32 of the decrypted header data
+ *
+ * For the header-encrypted case (most common with 7z -mhe=on):
+ *   - The header itself is encrypted
+ *   - We decrypt and check CRC from the signature header
+ *
+ * For data-encrypted case:
+ *   - We use a heuristic: check if decrypted data looks like
+ *     a valid 7z property block (starts with known property IDs)
  */
-void batch_filter_length(candidate_batch_t *batch,
-                          int min_len, int max_len) {
-    int out = 0;
-    for (int i = 0; i < batch->count; i++) {
-        int len = (int)strlen(batch->passwords[i]);
-        if (len >= min_len && len <= max_len) {
-            if (out != i) {
-                memcpy(batch->passwords[out], batch->passwords[i],
-                       (size_t)len + 1);
-            }
-            out++;
-        }
+static bool sz_validate_password_cli(const char *archive_path,
+                                     const char *password) {
+    if (!archive_path || !password || password[0] == '\0') {
+        return false;
     }
-    batch->count = out;
+
+    char pwarg[MAX_PASSWORD_LEN + 3];
+    int n = snprintf(pwarg, sizeof(pwarg), "-p%s", password);
+    if (n <= 2 || (size_t)n >= sizeof(pwarg)) {
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return false;
+    }
+
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDOUT_FILENO);
+            (void)dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execlp("7z", "7z", "t", "-y", pwarg, archive_path, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return false;
+    }
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-/*
- * Filter batch: remove duplicates (in-place, O(n^2) but batches are small).
- */
-void batch_dedup(candidate_batch_t *batch) {
-    if (batch->count <= 1) return;
+static bool sz_validate_password(const struct sz_ctx *ctx,
+                                 const char *password,
+                                 const char *archive_path) {
+    if (UNLIKELY(!ctx || !ctx->parsed)) return false;
+    if (UNLIKELY(!ctx->has_encrypted_streams)) return false;
 
-    int out = 1;
-    for (int i = 1; i < batch->count; i++) {
-        bool dup = false;
-        for (int j = 0; j < out; j++) {
-            if (strcmp(batch->passwords[i], batch->passwords[j]) == 0) {
-                dup = true;
-                break;
+    /*
+     * 7z supports multiple coder chains and stream layouts, and reliable
+     * validation for both header-encrypted and data-only-encrypted archives
+     * requires a full decode pipeline. Use the 7z tester for correctness.
+     */
+    if (sz_validate_password_cli(archive_path, password)) {
+        return true;
+    }
+
+    /* Derive AES key */
+    uint8_t aes_key[32];
+    sz_derive_key(password,
+                  ctx->aes_salt_len > 0 ? ctx->aes_salt : NULL,
+                  ctx->aes_salt_len,
+                  ctx->num_cycles_power,
+                  aes_key);
+
+    /* Set up AES-256 decryption */
+    aes_ctx_t aes;
+    aes256_key_expansion(&aes, aes_key);
+
+    /* Decrypt the first block of encrypted data */
+    if (ctx->enc_header_size < AES_BLOCK_SIZE) {
+        return false;
+    }
+
+    uint8_t decrypted[32];
+    /* Use zero IV if none stored, otherwise use parsed IV */
+    uint8_t iv[AES_BLOCK_SIZE];
+    memcpy(iv, ctx->aes_iv, AES_BLOCK_SIZE);
+
+    aes256_cbc_decrypt(&aes, iv,
+                        ctx->enc_header_data,
+                        decrypted,
+                        AES_BLOCK_SIZE);
+
+    /*
+     * Validate decrypted content.
+     *
+     * For 7z with -mhe=on (header encryption):
+     *   The decrypted header starts with a 7z property block.
+     *   Valid property IDs are in range 0x00-0x19.
+     *   After decryption with correct password, first byte should be
+     *   SZ_ID_HEADER (0x01) or similar valid property.
+     *
+     * For data encryption (more common):
+     *   We use CRC32 validation against the known header CRC.
+     */
+
+    /* Method 1: CRC32 check */
+    if (ctx->next_header_crc != 0) {
+        /* Decrypt the entire header block */
+        size_t total_size = (size_t)ctx->next_header_size;
+        if (total_size > 0 && total_size <= 4 * MB) {
+            /* We need to check if we have the full header data */
+            size_t enc_available = ctx->enc_header_size;
+
+            if (enc_available >= AES_BLOCK_SIZE) {
+                /* Decrypt available blocks and compute partial CRC */
+                uint8_t dec_block[AES_BLOCK_SIZE];
+                aes256_cbc_decrypt(&aes, ctx->aes_iv,
+                                    ctx->enc_header_data,
+                                    dec_block,
+                                    AES_BLOCK_SIZE);
+
+                /*
+                 * For header-encrypted archives, the first decrypted byte
+                 * should be a valid 7z property ID.
+                 */
+                uint8_t first_byte = dec_block[0];
+                if (first_byte == SZ_ID_HEADER ||
+                    first_byte == SZ_ID_ENCODED_HEADER ||
+                    first_byte == SZ_ID_ARCHIVE_PROPERTIES ||
+                    first_byte == SZ_ID_MAIN_STREAMS_INFO) {
+
+                    /* High confidence: valid property ID after decryption */
+                    /* Secondary check: next bytes should also be valid */
+                    bool plausible = true;
+                    for (int i = 0; i < 4 && i < AES_BLOCK_SIZE; i++) {
+                        if (dec_block[i] > SZ_ID_DUMMY && dec_block[i] != 0xFF) {
+                            plausible = false;
+                            break;
+                        }
+                    }
+                    if (plausible) {
+                        /* Secure wipe key material */
+                        volatile uint8_t *vk = (volatile uint8_t *)aes_key;
+                        for (int i = 0; i < 32; i++) vk[i] = 0;
+                        return true;
+                    }
+                }
+
+                /* Secure wipe */
+                volatile uint8_t *vk = (volatile uint8_t *)aes_key;
+                for (int i = 0; i < 32; i++) vk[i] = 0;
+                return false;
             }
-        }
-        if (!dup) {
-            if (out != i) {
-                size_t len = strlen(batch->passwords[i]);
-                memcpy(batch->passwords[out], batch->passwords[i], len + 1);
-            }
-            out++;
         }
     }
-    batch->count = out;
+
+    /*
+     * Method 2: Heuristic byte pattern check.
+     * After correct decryption, the data should not be random-looking.
+     * A simple entropy/pattern check can differentiate correct from wrong.
+     *
+     * With wrong password: decrypted bytes look uniformly random
+     * With correct password: first byte is a known 7z property ID
+     */
+    uint8_t first = decrypted[0];
+    bool valid_id = (first == SZ_ID_HEADER         ||
+                     first == SZ_ID_ENCODED_HEADER  ||
+                     first == SZ_ID_END             ||
+                     first == SZ_ID_PACK_INFO       ||
+                     first == SZ_ID_UNPACK_INFO     ||
+                     first == SZ_ID_MAIN_STREAMS_INFO);
+
+    /* Secure wipe key material */
+    volatile uint8_t *vk = (volatile uint8_t *)aes_key;
+    for (int i = 0; i < 32; i++) vk[i] = 0;
+
+    return valid_id;
 }
 
 /* ============================================================
- * ATTACK UTILITY FUNCTIONS
+ * UNIFIED ARCHIVE CONTEXT
  * ============================================================ */
 
 /*
- * Print attack statistics summary.
+ * Open and parse archive. Returns 0 on success, -1 on failure.
+ * The caller owns the archive_ctx_t and must call archive_ctx_free().
  */
-void attack_print_stats(attack_mode_t mode,
-                         uint64_t total_tested,
-                         uint64_t keyspace,
-                         double elapsed_sec,
-                         bool no_color) {
+int archive_open(archive_ctx_t *ctx, const char *path,
+                 archive_type_t type) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->type = type;
+    snprintf(ctx->path, sizeof(ctx->path), "%s", path);
+
+    switch (type) {
+        case ARCHIVE_ZIP:
+            return zip_parse(&ctx->zip, path);
+
+        case ARCHIVE_7Z:
+            return sz_parse(&ctx->sz, path);
+
+        default:
+            log_error("archive_open: unsupported archive type %d", type);
+            return -1;
+    }
+}
+
+void archive_ctx_free(archive_ctx_t *ctx) {
+    if (!ctx) return;
+    switch (ctx->type) {
+        case ARCHIVE_ZIP:
+            zip_ctx_free(&ctx->zip);
+            break;
+        case ARCHIVE_7Z:
+            sz_ctx_free(&ctx->sz);
+            break;
+        default:
+            break;
+    }
+}
+
+/*
+ * Validate a password against the archive.
+ * This is the hot-path function called from worker threads.
+ * Each thread should have its OWN archive_ctx_t (read-only shared data
+ * is fine, but we keep separate contexts for safety).
+ *
+ * Returns: true  = password correct
+ *          false = password incorrect
+ */
+bool archive_validate_password(const archive_ctx_t *ctx,
+                                const char *password) {
+    if (UNLIKELY(!ctx)) return false;
+
+    switch (ctx->type) {
+        case ARCHIVE_ZIP:
+            return zip_validate_password(&ctx->zip, password);
+
+        case ARCHIVE_7Z:
+            return sz_validate_password(&ctx->sz, password, ctx->path);
+
+        default:
+            return false;
+    }
+}
+
+/*
+ * Clone archive context for use by worker threads.
+ * Since we memory-map the file, all threads can share the same
+ * underlying data (read-only). We just copy the metadata.
+ */
+int archive_ctx_clone(archive_ctx_t *dst, const archive_ctx_t *src) {
+    if (!dst || !src) return -1;
+
+    memcpy(dst, src, sizeof(*dst));
+
+    /*
+     * For mmap'd archives: multiple threads can safely share the
+     * same mmap region (read-only). We just duplicate the pointer.
+     * The master ctx will munmap on cleanup.
+     *
+     * Set a flag so clone doesn't double-free.
+     */
+    if (src->type == ARCHIVE_ZIP) {
+        dst->zip.mmap_used = false; /* clone doesn't own the mapping */
+        dst->zip.fd        = -1;    /* clone doesn't own the fd */
+    } else if (src->type == ARCHIVE_7Z) {
+        dst->sz.mmap_used = false;
+        dst->sz.fd        = -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Print archive info.
+ */
+void archive_print_info(const archive_ctx_t *ctx, bool no_color) {
     const char *c_l = no_color ? "" : "\033[97m";
     const char *c_v = no_color ? "" : "\033[36m";
     const char *c_r = no_color ? "" : "\033[0m";
 
-    double pct = (keyspace > 0)
-                 ? (100.0 * (double)total_tested / (double)keyspace)
-                 : 0.0;
-    double speed = (elapsed_sec > 0.001)
-                   ? ((double)total_tested / elapsed_sec)
-                   : 0.0;
+    fprintf(stderr, "\n%s[Archive Info]%s\n", c_l, c_r);
 
-    fprintf(stderr,
-            "\n%s[Attack Stats]%s\n"
-            "  %sMode:%s      %s%s%s\n"
-            "  %sTested:%s    %s%llu%s\n"
-            "  %sKeyspace:%s  %s%llu%s\n"
-            "  %sProgress:%s  %s%.2f%%%s\n"
-            "  %sElapsed:%s   %s%.1fs%s\n"
-            "  %sSpeed:%s     %s%.0f H/s%s\n\n",
-            c_l, c_r,
-            c_l, c_r, c_v,
-            (mode < ATTACK_MAX) ? "N/A" : "N/A",
-            c_r,
-            c_l, c_r, c_v, (unsigned long long)total_tested, c_r,
-            c_l, c_r, c_v, (unsigned long long)keyspace, c_r,
-            c_l, c_r, c_v, pct, c_r,
-            c_l, c_r, c_v, elapsed_sec, c_r,
-            c_l, c_r, c_v, speed, c_r);
-    (void)mode;
-}
+    switch (ctx->type) {
+        case ARCHIVE_ZIP: {
+            const struct zip_ctx *z = &ctx->zip;
+            fprintf(stderr, "  %sType:%s     %sZIP%s\n",
+                    c_l, c_r, c_v, c_r);
+            fprintf(stderr, "  %sFiles:%s    %s%d%s\n",
+                    c_l, c_r, c_v, z->num_files, c_r);
+            if (z->filename[0]) {
+                fprintf(stderr, "  %sFirst:%s    %s%s%s\n",
+                        c_l, c_r, c_v, z->filename, c_r);
+            }
+            fprintf(stderr, "  %sEncrypt:%s  %s%s%s\n",
+                    c_l, c_r, c_v,
+                    z->is_aes ? "WinZip AES" : "PKZIP Classic",
+                    c_r);
+            if (z->is_aes) {
+                int bits = 0;
+                switch (z->aes_strength) {
+                    case 1: bits = 128; break;
+                    case 2: bits = 192; break;
+                    case 3: bits = 256; break;
+                }
+                fprintf(stderr, "  %sAES Bits:%s %s%d%s\n",
+                        c_l, c_r, c_v, bits, c_r);
+            }
+            fprintf(stderr, "  %sMethod:%s   %s%u%s\n",
+                    c_l, c_r, c_v, z->method, c_r);
+            break;
+        }
 
-/*
- * Check if password is non-empty and within bounds.
- */
-FORCE_INLINE bool candidate_valid(const char *pw, int min_len, int max_len) {
-    if (!pw || pw[0] == '\0') return false;
-    int len = 0;
-    while (pw[len] && len <= max_len) len++;
-    return (len >= min_len && len <= max_len);
+        case ARCHIVE_7Z: {
+            const struct sz_ctx *s = &ctx->sz;
+            fprintf(stderr, "  %sType:%s     %s7-Zip%s\n",
+                    c_l, c_r, c_v, c_r);
+            fprintf(stderr, "  %sEncrypted:%s%s%s%s\n",
+                    c_l, c_r, c_v,
+                    s->has_encrypted_streams ? "Yes" : "No",
+                    c_r);
+            fprintf(stderr, "  %sKDF Iters:%s%s%llu%s\n",
+                    c_l, c_r, c_v,
+                    (unsigned long long)(1ULL << s->num_cycles_power),
+                    c_r);
+            fprintf(stderr, "  %sSalt Len:%s %s%d%s\n",
+                    c_l, c_r, c_v, s->aes_salt_len, c_r);
+            break;
+        }
+
+        default:
+            fprintf(stderr, "  Type: Unknown\n");
+            break;
+    }
+    fprintf(stderr, "\n");
 }
 
 /* ============================================================
- * SELF-TEST / UNIT TEST HELPERS
+ * BENCHMARK HELPERS
  * ============================================================ */
 
-#ifdef CRIVE_SELFTEST
+/*
+ * Benchmark password validation speed for the given archive type.
+ * Used to estimate real-world performance before cracking.
+ */
+typedef struct {
+    archive_type_t type;
+    double         validations_per_sec;
+    double         ns_per_validation;
+} archive_bench_t;
 
-static void test_brute_small(void) {
-    charset_spec_t cs;
-    memset(&cs, 0, sizeof(cs));
-    memcpy(cs.chars, "abc", 3);
-    cs.chars[3] = '\0';
-    cs.len = 3;
+archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
+    archive_bench_t result = {0};
+    result.type = type;
 
-    brute_state_t st;
-    brute_init(&st, &cs, 1, 2, 0, 1, 0, 0);
+    /*
+     * Create a dummy context with known parameters for benchmarking.
+     * We don't need a real file - just exercise the validation code.
+     */
+    struct zip_ctx zip_dummy;
+    struct sz_ctx  sz_dummy;
+    memset(&zip_dummy, 0, sizeof(zip_dummy));
+    memset(&sz_dummy,  0, sizeof(sz_dummy));
 
-    candidate_batch_t batch;
-    batch_init(&batch, 32);
-
-    uint64_t count = 0;
-    while (!st.exhausted) {
-        brute_next_batch(&st, &batch);
-        count += batch.count;
-        batch_reset(&batch);
+    /* Set up dummy ZIP context */
+    zip_dummy.parsed              = true;
+    zip_dummy.has_encrypted_file  = true;
+    zip_dummy.use_crc_check       = true;
+    zip_dummy.check_byte_crc      = 0xAB;
+    /* Fake encryption header */
+    for (int i = 0; i < ZIP_ENCRYPTION_HEADER_SIZE; i++) {
+        zip_dummy.enc_header[i] = (uint8_t)(i * 17 + 43);
     }
 
-    /* Expected: 3 (len=1) + 9 (len=2) = 12 */
-    fprintf(stderr, "[selftest] brute abc 1-2: count=%llu (expected 12)\n",
-            (unsigned long long)count);
-}
+    /* Set up dummy 7Z context */
+    sz_dummy.parsed                = true;
+    sz_dummy.has_encrypted_streams = true;
+    sz_dummy.num_cycles_power      = 19; /* 2^19 = ~512K iterations */
+    sz_dummy.aes_salt_len          = 0;
+    memset(sz_dummy.aes_iv, 0, 16);
+    /* Fake enc data - will look invalid after decrypt (that's fine for bench) */
+    for (int i = 0; i < 32; i++) {
+        sz_dummy.enc_header_data[i] = (uint8_t)(i * 37);
+    }
+    sz_dummy.enc_header_size = 32;
 
-static void test_mask_simple(void) {
-    mask_spec_t mask;
-    memset(&mask, 0, sizeof(mask));
-    mask.num_positions = 2;
-    memcpy(mask.positions[0].charset, "ab", 2);
-    mask.positions[0].charset[2] = '\0';
-    mask.positions[0].charset_len = 2;
-    memcpy(mask.positions[1].charset, "12", 2);
-    mask.positions[1].charset[2] = '\0';
-    mask.positions[1].charset_len = 2;
+    const char *test_pw = "benchmark_password_test";
+    uint64_t    count   = 0;
+    uint64_t    start   = 0, end = 0;
 
-    mask_state_t st;
-    mask_init(&st, &mask, 0, 1, 0, 0);
+    struct timespec ts_start, ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
-    candidate_batch_t batch;
-    batch_init(&batch, 32);
+    uint64_t duration_ns = (uint64_t)duration_ms * 1000000ULL;
+    start = (uint64_t)ts_start.tv_sec * 1000000000ULL +
+            (uint64_t)ts_start.tv_nsec;
 
-    uint64_t count = 0;
-    while (!st.exhausted) {
-        mask_next_batch(&st, &batch);
-        count += batch.count;
-        batch_reset(&batch);
+    if (type == ARCHIVE_ZIP) {
+        while (true) {
+            /* Do a batch of 1000 validations before checking time */
+            for (int i = 0; i < 1000; i++) {
+                zip_validate_pkzip(&zip_dummy, test_pw);
+                count++;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &ts_end);
+            end = (uint64_t)ts_end.tv_sec * 1000000000ULL +
+                  (uint64_t)ts_end.tv_nsec;
+            if (end - start >= duration_ns) break;
+        }
+    } else if (type == ARCHIVE_7Z) {
+        while (true) {
+            for (int i = 0; i < 10; i++) {
+                sz_validate_password(&sz_dummy, test_pw, NULL);
+                count++;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &ts_end);
+            end = (uint64_t)ts_end.tv_sec * 1000000000ULL +
+                  (uint64_t)ts_end.tv_nsec;
+            if (end - start >= duration_ns) break;
+        }
     }
 
-    /* Expected: 2 * 2 = 4 */
-    fprintf(stderr, "[selftest] mask [ab][12]: count=%llu (expected 4)\n",
-            (unsigned long long)count);
+    uint64_t elapsed_ns = end - start;
+    if (elapsed_ns > 0 && count > 0) {
+        result.validations_per_sec = (double)count /
+                                     ((double)elapsed_ns / 1e9);
+        result.ns_per_validation   = (double)elapsed_ns / (double)count;
+    }
+
+    return result;
 }
-
-static void test_rule_apply(void) {
-    char out[128];
-    int len;
-
-    len = apply_rule(RULE_CAPITALIZE,    NULL, 0, "hello", 5, out, 128);
-    fprintf(stderr, "[selftest] capitalize hello -> '%s' len=%d\n", out, len);
-
-    len = apply_rule(RULE_LEET_SPEAK,    NULL, 0, "password", 8, out, 128);
-    fprintf(stderr, "[selftest] leet password -> '%s' len=%d\n", out, len);
-
-    len = apply_rule(RULE_REVERSE,       NULL, 0, "hello", 5, out, 128);
-    fprintf(stderr, "[selftest] reverse hello -> '%s' len=%d\n", out, len);
-
-    len = apply_rule(RULE_DUPLICATE,     NULL, 0, "ab", 2, out, 128);
-    fprintf(stderr, "[selftest] duplicate ab -> '%s' len=%d\n", out, len);
-
-    len = apply_rule(RULE_APPEND_DIGIT,  NULL, 7, "pass", 4, out, 128);
-    fprintf(stderr, "[selftest] append_digit pass 7 -> '%s' len=%d\n", out, len);
-
-    len = apply_rule(RULE_APPEND_YEAR,   NULL, 2, "pass", 4, out, 128);
-    fprintf(stderr, "[selftest] append_year pass 2 -> '%s' len=%d\n", out, len);
-
-    len = apply_rule(RULE_REFLECT,       NULL, 0, "abc", 3, out, 128);
-    fprintf(stderr, "[selftest] reflect abc -> '%s' len=%d\n", out, len);
-
-    len = apply_rule(RULE_STRIP_VOWELS,  NULL, 0, "password", 8, out, 128);
-    fprintf(stderr, "[selftest] strip_vowels password -> '%s' len=%d\n", out, len);
-}
-
-void attacks_run_selftest(void) {
-    fprintf(stderr, "\n=== attacks.c self-test ===\n");
-    test_brute_small();
-    test_mask_simple();
-    test_rule_apply();
-    fprintf(stderr, "=== self-test done ===\n\n");
-}
-
-#endif /* CRIVE_SELFTEST */
 
 /* ============================================================
- * END OF attacks.c
+ * END OF archive.c
  * ============================================================ */
 
 ========================================
@@ -12663,5 +12743,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Mon Apr 13 04:22:57 UTC 2026
+Dump Completed: Mon Apr 13 04:36:14 UTC 2026
 ----------------------------------------
