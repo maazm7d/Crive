@@ -27,6 +27,8 @@ typedef struct zip_ctx {
     bool             mmap_used;
     int              fd;
 
+    char             archive_path[MAX_PATH_LEN];   /* archive path for CLI verification */
+
     uint32_t         crc32;
     uint16_t         flags;
     uint16_t         method;
