@@ -1733,6 +1733,7 @@ int mask_parse(mask_spec_t *ms, const char *mask_str,
                int num_custom) {
     memset(ms, 0, sizeof(*ms));
     str_copy(ms->raw_mask, sizeof(ms->raw_mask), mask_str);
+    log_debug("mask_parse: raw_mask = '%s'", ms->raw_mask);
 
     const char *p   = mask_str;
     int         pos = 0;
