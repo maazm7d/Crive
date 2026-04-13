@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Mon Apr 13 08:46:15 UTC 2026
+Generated: Mon Apr 13 09:17:37 UTC 2026
 ==============================
 
 FILE TREE:
@@ -10350,6 +10350,8 @@ FILE: ./archive.c
  *
  * FIX: Full CRC32 validation on decrypted+decompressed data to
  *      eliminate ALL false positives in PKZIP validation.
+ * FIX2: Added CLI fallback (7z t) for DEFLATE/LZMA/BZIP2 to kill
+ *       structural false positives.
  */
 
 #include <stdio.h>
@@ -11211,6 +11213,9 @@ static bool zip_parse_aes_extra(const uint8_t *extra, uint16_t extra_len,
 int zip_parse(struct zip_ctx *ctx, const char *path) {
     memset(ctx, 0, sizeof(*ctx));
 
+    /* Store archive path for later CLI verification */
+    snprintf(ctx->archive_path, sizeof(ctx->archive_path), "%s", path);
+
     ctx->fd = open(path, O_RDONLY);
     if (ctx->fd < 0) {
         log_error("zip_parse: cannot open '%s': %s", path, strerror(errno));
@@ -11500,31 +11505,6 @@ static void pbkdf2_sha1(const uint8_t *password, size_t pass_len,
 
 /* ============================================================
  * CRC32 STREAMING VALIDATION FOR PKZIP
- *
- * For STORED files: decrypt all bytes, compute CRC32, compare.
- * For DEFLATED files: we cannot decompress without zlib, so we
- *   fall back to a two-stage check:
- *     1. The 12-byte header byte-11 check (very fast reject)
- *     2. CRC32 of the raw decrypted+compressed stream bytes
- *        compared against the known stored CRC32 cannot work
- *        because the stored CRC32 is of the *uncompressed* data.
- *
- * Therefore for DEFLATED we implement a practical optimisation:
- *   - Decrypt ALL compressed bytes into a temporary buffer
- *   - Verify that the decrypted bytes form a structurally valid
- *     deflate/bzip2/lzma stream (magic + first-byte checks)
- *   - Additionally compute CRC32 of those compressed bytes and
- *     verify they match the stored *compressed* CRC32 IFF the
- *     archive was created with the non-data-descriptor path
- *     (use_crc_check == true and crc32 != 0).
- *
- * For STORED files (method == 0):
- *   - Decrypt all bytes
- *   - Compute CRC32 of plaintext
- *   - Compare with stored CRC32  ← definitive, zero false positives
- *
- * The maximum buffer size we will allocate for CRC32 validation
- * is capped at CRC32_MAX_VALIDATE_BYTES to keep RAM bounded.
  * ============================================================ */
 
 /*
@@ -11616,29 +11596,9 @@ static bool zip_crc32_validate_stored(const struct zip_ctx *ctx,
  * zip_validate_deflate_stream:
  *   Decrypt the first N bytes of a DEFLATED stream and check whether
  *   they look like valid deflate-compressed data.
- *
- *   ZIP stores raw deflate (RFC 1951), NOT zlib (RFC 1950).
- *   So there is NO 0x78 0x9C magic header.
- *
- *   A raw deflate stream starts with a 3-bit block header:
- *     bits[0]    : BFINAL (0 or 1)
- *     bits[2:1]  : BTYPE  (00=no compress, 01=fixed Huffman, 10=dynamic Huffman)
- *   Valid BTYPE values are 00, 01, 10 (11 is reserved/invalid).
- *
- *   We check:
- *     - BTYPE != 11  (not reserved)
- *     - At least one of the first 16 bytes is non-zero
- *       (all-zero compressed stream is almost impossible with wrong key)
- *
- *   Additionally for the CRC32 of compressed data:
- *   ZIP stores CRC32 of the *uncompressed* data, which we cannot compute
- *   without decompressing. However, we can do a fast reject by checking
- *   that the decrypted bytes are not statistically random (entropy check
- *   is expensive — we use the structural approach above instead).
  */
 static bool zip_validate_deflate_stream(const struct zip_ctx *ctx,
                                          zip_keys_t *keys) {
-    /* Decrypt first 32 bytes of compressed stream */
     size_t peek = 32;
     if (ctx->data_offset + peek > ctx->data_size) {
         peek = ctx->data_size - ctx->data_offset;
@@ -11650,25 +11610,15 @@ static bool zip_validate_deflate_stream(const struct zip_ctx *ctx,
         return false;
     }
 
-    /*
-     * Raw deflate block header check (first byte):
-     * bit 0    = BFINAL (0 or 1 — both valid)
-     * bits 2:1 = BTYPE
-     *   00 = stored block
-     *   01 = fixed Huffman
-     *   10 = dynamic Huffman
-     *   11 = reserved (INVALID)
-     */
+    /* Raw deflate block header check */
     uint8_t btype = (buf[0] >> 1) & 0x03;
     if (btype == 0x03) {
-        /* Reserved BTYPE — definitely wrong password */
         log_debug("zip_validate_deflate: invalid BTYPE=11");
         return false;
     }
 
-    /* Stored-block sub-check: if BTYPE==00, bytes 1-4 are LEN, NLEN */
+    /* Stored-block sub-check */
     if (btype == 0x00 && peek >= 5) {
-        /* LEN is 2 bytes, NLEN is one's complement of LEN */
         uint16_t len  = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
         uint16_t nlen = (uint16_t)buf[3] | ((uint16_t)buf[4] << 8);
         if ((uint16_t)(len ^ nlen) != 0xFFFF) {
@@ -11677,31 +11627,20 @@ static bool zip_validate_deflate_stream(const struct zip_ctx *ctx,
         }
     }
 
-    /* Dynamic Huffman sub-check: if BTYPE==10, sanity on HLIT/HDIST/HCLEN */
+    /* Dynamic Huffman sub-check */
     if (btype == 0x02 && peek >= 4) {
-        /*
-         * After the 3-bit block header (bits 0-2 of byte 0):
-         *   HLIT  = 5 bits (# literal/length codes - 257)  → 0..29 valid
-         *   HDIST = 5 bits (# distance codes - 1)          → 0..29 valid
-         *   HCLEN = 4 bits (# code-length codes - 4)       → 0..15 valid
-         * We do a loose check on HLIT: if > 29, invalid.
-         */
-        /* Pack 4 bytes into a 32-bit value for bit extraction */
         uint32_t bits = (uint32_t)buf[0]        |
                         ((uint32_t)buf[1] << 8)  |
                         ((uint32_t)buf[2] << 16) |
                         ((uint32_t)buf[3] << 24);
-        uint32_t hlit = (bits >> 3) & 0x1F; /* bits 7:3 */
+        uint32_t hlit = (bits >> 3) & 0x1F;
         if (hlit > 29) {
             log_debug("zip_validate_deflate: HLIT=%u out of range", hlit);
             return false;
         }
     }
 
-    /* All-zeros check — with a wrong key the data could be non-zero too,
-     * but all-zero decrypted output is a reliable bad-password signal
-     * because PKZIP produces high-entropy ciphertext, so a wrong key
-     * yields high-entropy plaintext (not all-zero). */
+    /* All-zeros check */
     bool all_zero = true;
     for (size_t i = 0; i < peek; i++) {
         if (buf[i] != 0) { all_zero = false; break; }
@@ -11713,7 +11652,6 @@ static bool zip_validate_deflate_stream(const struct zip_ctx *ctx,
 
 /*
  * zip_validate_bzip2_stream:
- *   BZip2 magic: "BZh" followed by digit '1'..'9'
  */
 static bool zip_validate_bzip2_stream(const struct zip_ctx *ctx,
                                        zip_keys_t *keys) {
@@ -11731,12 +11669,6 @@ static bool zip_validate_bzip2_stream(const struct zip_ctx *ctx,
 
 /*
  * zip_validate_lzma_stream:
- *   LZMA (method 14) in ZIP uses a specific header layout.
- *   The first 4 bytes are a version/properties field:
- *     bytes 0-1: version (0x00, 0x00)  or (0x14, 0x00)
- *     bytes 2-3: size of properties (always 0x05, 0x00)
- *   Followed by 5 bytes of LZMA properties.
- *   So first byte is 0x00 or 0x14, third byte is 0x05.
  */
 static bool zip_validate_lzma_stream(const struct zip_ctx *ctx,
                                       zip_keys_t *keys) {
@@ -11749,47 +11681,49 @@ static bool zip_validate_lzma_stream(const struct zip_ctx *ctx,
         return false;
     }
 
-    /* byte 2-3: props size == 5 */
     if (buf[2] != 0x05 || buf[3] != 0x00) return false;
-    /* byte 0: version (0x00 or 0x14) */
     if (buf[0] != 0x00 && buf[0] != 0x14) return false;
 
     return true;
 }
 
 /* ============================================================
- * MAIN PKZIP VALIDATION — WITH FULL CRC32 FOR STORED FILES
+ * ZIP CLI VALIDATION (definitive fallback)
  * ============================================================ */
 
-/*
- * zip_validate_pkzip:
- *
- *   Stage 1 (fast): Decrypt 12-byte encryption header, check byte 11.
- *     ~99.6% of wrong passwords are rejected here (1/256 false-pass rate).
- *
- *   Stage 2 (definitive): Depends on compression method:
- *
- *     STORED (method 0):
- *       Decrypt ALL payload bytes, compute CRC32, compare with stored
- *       value from central directory. Zero false positives.
- *
- *     DEFLATED (method 8):
- *       Decrypt first 32 bytes, check raw deflate block header validity
- *       (BTYPE != 11, HLIT range, stored-block LEN/NLEN). Reduces false
- *       positives from ~0.4% to <0.01%. We cannot do CRC32 without a
- *       decompressor, but the structural checks are strong enough.
- *
- *     BZIP2 (method 12):
- *       Check "BZh1"-"BZh9" magic. Very strong signal.
- *
- *     LZMA (method 14):
- *       Check LZMA ZIP wrapper header. Strong signal.
- *
- *     Other:
- *       Accept after stage 1 only (conservative).
- *
- *   Returns true if password is almost certainly correct.
- */
+static bool zip_validate_cli(const char *archive_path, const char *password) {
+    if (!archive_path || !password || password[0] == '\0')
+        return false;
+
+    char pwarg[MAX_PASSWORD_LEN + 3];
+    int n = snprintf(pwarg, sizeof(pwarg), "-p%s", password);
+    if (n <= 2 || (size_t)n >= sizeof(pwarg))
+        return false;
+
+    pid_t pid = fork();
+    if (pid < 0) return false;
+
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execlp("7z", "7z", "t", "-y", pwarg, archive_path, (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return false;
+
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* ============================================================
+ * MAIN PKZIP VALIDATION — WITH CLI FALLBACK
+ * ============================================================ */
+
 static bool zip_validate_pkzip(const struct zip_ctx *ctx,
                                 const char *password) {
     if (UNLIKELY(!ctx->parsed)) return false;
@@ -11807,48 +11741,42 @@ static bool zip_validate_pkzip(const struct zip_ctx *ctx,
                                        : ctx->check_byte_time;
 
     if (decrypted[ZIP_ENCRYPTION_HEADER_SIZE - 1] != check) {
-        return false; /* Fast reject — wrong password */
+        return false;
     }
 
-    /*
-     * ── Stage 2: Compression-method-specific CRC32 / structural check ──
-     *
-     * The keys state has been updated by the 12-byte header decrypt,
-     * so it is now positioned at the start of the compressed payload.
-     * We pass it directly to the per-method validators.
-     */
-
-    /* Resolve effective method (WinZip AES stores actual method separately) */
     uint16_t method = ctx->method;
+    bool structural_ok = false;
 
     switch (method) {
         case ZIP_METHOD_STORED:
-            /*
-             * DEFINITIVE CRC32 CHECK.
-             * Decrypt every byte of the payload and verify CRC32.
-             * This is 100% reliable for stored files.
-             */
+            /* CRC32 is already definitive */
             return zip_crc32_validate_stored(ctx, &keys);
 
         case ZIP_METHOD_DEFLATED:
-            return zip_validate_deflate_stream(ctx, &keys);
-
+            structural_ok = zip_validate_deflate_stream(ctx, &keys);
+            break;
         case ZIP_METHOD_BZIP2:
-            return zip_validate_bzip2_stream(ctx, &keys);
-
+            structural_ok = zip_validate_bzip2_stream(ctx, &keys);
+            break;
         case ZIP_METHOD_LZMA:
-            return zip_validate_lzma_stream(ctx, &keys);
-
+            structural_ok = zip_validate_lzma_stream(ctx, &keys);
+            break;
         default:
-            /*
-             * Unknown method — we cannot do a structural check.
-             * The header check alone gives us ~1/256 false positive rate.
-             * Accept and let the caller deal with potential fp.
-             */
-            log_debug("zip_validate_pkzip: unknown method %u, "
-                      "header check only", method);
+            /* Unknown method – accept structural only (conservative) */
+            log_debug("zip_validate_pkzip: unknown method %u, header check only", method);
             return true;
     }
+
+    if (!structural_ok)
+        return false;
+
+    /* Stage 3: definitive CLI test for compressed methods */
+    if (!zip_validate_cli(ctx->archive_path, password)) {
+        log_debug("zip_validate_pkzip: structural check passed but CLI rejected password");
+        return false;
+    }
+
+    return true;
 }
 
 /* ============================================================
@@ -12314,14 +12242,6 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
 
     /*
      * ── 7Z CRC32 validation of decrypted header ──
-     *
-     * For header-encrypted archives (-mhe=on), the decrypted block starts
-     * with the 7z NextHeader property stream. The next_header_crc stored in
-     * the SignatureHeader covers the ENTIRE NextHeader blob.
-     *
-     * If we have the full header data available (enc_header_size covers it),
-     * we decrypt it all and compute CRC32 against next_header_crc.
-     * This is the definitive test — same approach as what 7-Zip itself does.
      */
     bool validated = false;
 
@@ -12332,25 +12252,14 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
         size_t hdr_sz = (size_t)ctx->next_header_size;
         size_t aes_len = (hdr_sz + AES_BLOCK_SIZE - 1) & ~(size_t)(AES_BLOCK_SIZE - 1);
 
-        /*
-         * We need the full encrypted header bytes.
-         * They live at: file_offset = sizeof(signature_header) +
-         *               next_header_offset
-         * We stored them in enc_header_data only if small enough.
-         * Re-read from the mmap'd data pointer using the known offset.
-         *
-         * The ctx->data pointer is valid (we're in validate, not after free).
-         */
         size_t hdr_file_offset = sizeof(sz_signature_header_t) +
                                   (size_t)ctx->next_header_offset;
 
         if (ctx->data != NULL &&
             hdr_file_offset + hdr_sz <= ctx->data_size) {
 
-            /* Allocate buffer large enough for the padded decryption */
             uint8_t *dec_hdr = (uint8_t *)malloc(aes_len);
             if (dec_hdr) {
-                /* Encrypted data padded to AES block size */
                 uint8_t *enc_padded = (uint8_t *)malloc(aes_len);
                 if (enc_padded) {
                     memcpy(enc_padded,
@@ -12365,11 +12274,6 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
                                         aes_len);
                     free(enc_padded);
 
-                    /*
-                     * Compute CRC32 of the decrypted header.
-                     * The stored next_header_crc uses the standard
-                     * CRC32 with 0xFFFFFFFF pre/post XOR.
-                     */
                     uint32_t computed_crc = crc32_full(dec_hdr, hdr_sz);
                     free(dec_hdr);
 
@@ -12381,7 +12285,6 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
                         log_debug("sz_validate: CRC32 mismatch "
                                   "computed=0x%08X stored=0x%08X",
                                   computed_crc, ctx->next_header_crc);
-                        /* Secure wipe */
                         volatile uint8_t *vk = (volatile uint8_t *)aes_key;
                         for (int i = 0; i < 32; i++) vk[i] = 0;
                         return false;
@@ -12394,11 +12297,6 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
     }
 
     if (!validated) {
-        /*
-         * Fallback: check if first decrypted byte is a valid 7z property ID.
-         * This is weak (~1/256 fp rate) but used only when CRC32 check
-         * is not possible (e.g. data-encrypted archive or large header).
-         */
         uint8_t first = dec_block[0];
         bool valid_id = (first == SZ_ID_HEADER          ||
                          first == SZ_ID_ENCODED_HEADER   ||
@@ -12613,5 +12511,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Mon Apr 13 08:46:16 UTC 2026
+Dump Completed: Mon Apr 13 09:17:37 UTC 2026
 ----------------------------------------
