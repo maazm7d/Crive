@@ -1985,6 +1985,7 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
         ctx->next_header_size <= (uint64_t)(4 * MB)) {
 
         size_t hdr_sz = (size_t)ctx->next_header_size;
+        size_t aes_len = (hdr_sz + AES_BLOCK_SIZE - 1) & ~(size_t)(AES_BLOCK_SIZE - 1);
 
         /*
          * We need the full encrypted header bytes.
@@ -2001,12 +2002,10 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
         if (ctx->data != NULL &&
             hdr_file_offset + hdr_sz <= ctx->data_size) {
 
-            uint8_t *dec_hdr = (uint8_t *)malloc(hdr_sz);
+            /* Allocate buffer large enough for the padded decryption */
+            uint8_t *dec_hdr = (uint8_t *)malloc(aes_len);
             if (dec_hdr) {
-                /* Align to AES block size — pad with zeros if needed */
-                size_t aes_len = (hdr_sz + AES_BLOCK_SIZE - 1) &
-                                 ~(size_t)(AES_BLOCK_SIZE - 1);
-
+                /* Encrypted data padded to AES block size */
                 uint8_t *enc_padded = (uint8_t *)malloc(aes_len);
                 if (enc_padded) {
                     memcpy(enc_padded,
