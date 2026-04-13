@@ -49,6 +49,7 @@ typedef struct zip_ctx {
     int              num_files;
     char             filename[256];
     bool             has_encrypted_file;
+    uint32_t         data_offset;             /* offset of encrypted data (after header) */
 } zip_ctx_t;
 
 /* -------------------------------------------------------------------------
