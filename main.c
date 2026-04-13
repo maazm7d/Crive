@@ -865,19 +865,35 @@ static int validate_config(config_t *cfg) {
         }
     }
 
-    /* Validate mask if mask mode */
-    if (cfg->attack_mode == ATTACK_MASK) {
-        if (cfg->mask.raw_mask[0] == '\0') {
-            safe_eprint("%s Mask attack requires --mask <pattern>\n",
-                        SYM_ERR);
-            return -1;
-        }
-        if (mask_parse(&cfg->mask, cfg->mask.raw_mask, NULL, 0) != 0) {
-            safe_eprint("%s Invalid mask pattern: %s\n",
-                        SYM_ERR, cfg->mask.raw_mask);
-            return -1;
+/* Validate mask if mask mode */
+if (cfg->attack_mode == ATTACK_MASK) {
+    if (cfg->mask.raw_mask[0] == '\0') {
+        safe_eprint("%s Mask pattern is empty.\n", SYM_ERR);
+        safe_eprint("   Did you forget to quote the mask? Use: --mask '?l?l?d?d'\n");
+        safe_eprint("   If you already used quotes, check for shell wildcard expansion.\n");
+        return -1;
+    }
+
+    /* Warn about possible shell expansion if pattern contains wildcards */
+    bool has_wildcard = false;
+    for (const char *p = cfg->mask.raw_mask; *p; p++) {
+        if (*p == '*' || *p == '?' || *p == '[') {
+            has_wildcard = true;
+            break;
         }
     }
+    if (has_wildcard) {
+        safe_eprint("%s Your mask contains wildcard characters (*, ?, [).\n", SYM_WARN);
+        safe_eprint("   To prevent shell expansion, always quote the mask:\n");
+        safe_eprint("       crive %s --mask '%s'\n", cfg->archive_path, cfg->mask.raw_mask);
+    }
+
+    if (mask_parse(&cfg->mask, cfg->mask.raw_mask, NULL, 0) != 0) {
+        safe_eprint("%s Invalid mask pattern: '%s'\n",
+                    SYM_ERR, cfg->mask.raw_mask);
+        return -1;
+    }
+}
 
     /* Length sanity */
     if (cfg->min_length > cfg->max_length) {
