@@ -628,16 +628,20 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
                 break;
 
             case 'm':
-    cfg->attack_mode = ATTACK_MASK;
-    if (!optarg || optarg[0] == '\0') {
-        safe_eprint("%s Mask argument is empty.\n", SYM_ERR);
-        safe_eprint("   Please provide a mask pattern and quote it:\n");
-        safe_eprint("       crive %s --mask '?l?l?d?d'\n", cfg->archive_path);
-        return -1;
-    }
-    snprintf(cfg->mask.raw_mask, sizeof(cfg->mask.raw_mask),
-             "%s", optarg);
-    break;
+                cfg->attack_mode = ATTACK_MASK;
+                if (!optarg || optarg[0] == '\0') {
+                    safe_eprint("%s Mask argument is empty.\n", SYM_ERR);
+                    safe_eprint("   Please provide a mask pattern and quote it:\n");
+                    safe_eprint("       crive %s --mask '?l?l?d?d'\n", cfg->archive_path);
+                    return -1;
+                }
+                snprintf(cfg->mask.raw_mask, sizeof(cfg->mask.raw_mask),
+                         "%s", optarg);
+                /* DIAGNOSTIC */
+                safe_eprint("[DIAG] optarg = '%s'\n", optarg);
+                safe_eprint("[DIAG] raw_mask = '%s' (len=%zu)\n",
+                            cfg->mask.raw_mask, strlen(cfg->mask.raw_mask));
+                break;
 
             case 'H':
                 cfg->attack_mode = ATTACK_HYBRID;
@@ -865,35 +869,40 @@ static int validate_config(config_t *cfg) {
         }
     }
 
-/* Validate mask if mask mode */
-if (cfg->attack_mode == ATTACK_MASK) {
-    if (cfg->mask.raw_mask[0] == '\0') {
-        safe_eprint("%s Mask pattern is empty.\n", SYM_ERR);
-        safe_eprint("   Did you forget to quote the mask? Use: --mask '?l?l?d?d'\n");
-        safe_eprint("   If you already used quotes, check for shell wildcard expansion.\n");
-        return -1;
-    }
+    /* Validate mask if mask mode */
+    if (cfg->attack_mode == ATTACK_MASK) {
+        /* DIAGNOSTIC */
+        safe_eprint("[DIAG] In validate_config: raw_mask = '%s'\n", cfg->mask.raw_mask);
 
-    /* Warn about possible shell expansion if pattern contains wildcards */
-    bool has_wildcard = false;
-    for (const char *p = cfg->mask.raw_mask; *p; p++) {
-        if (*p == '*' || *p == '?' || *p == '[') {
-            has_wildcard = true;
-            break;
+        if (cfg->mask.raw_mask[0] == '\0') {
+            safe_eprint("%s Mask pattern is empty.\n", SYM_ERR);
+            safe_eprint("   Did you forget to quote the mask? Use: --mask '?l?l?d?d'\n");
+            safe_eprint("   If you already used quotes, check for shell wildcard expansion.\n");
+            return -1;
+        }
+
+        /* Warn about possible shell expansion if pattern contains wildcards */
+        bool has_wildcard = false;
+        for (const char *p = cfg->mask.raw_mask; *p; p++) {
+            if (*p == '*' || *p == '?' || *p == '[') {
+                has_wildcard = true;
+                break;
+            }
+        }
+        if (has_wildcard) {
+            safe_eprint("%s Your mask contains wildcard characters (*, ?, [).\n", SYM_WARN);
+            safe_eprint("   To prevent shell expansion, always quote the mask:\n");
+            safe_eprint("       crive %s --mask '%s'\n", cfg->archive_path, cfg->mask.raw_mask);
+        }
+
+        int parse_ret = mask_parse(&cfg->mask, cfg->mask.raw_mask, NULL, 0);
+        safe_eprint("[DIAG] mask_parse returned %d\n", parse_ret);
+        if (parse_ret != 0) {
+            safe_eprint("%s Invalid mask pattern: '%s'\n",
+                        SYM_ERR, cfg->mask.raw_mask);
+            return -1;
         }
     }
-    if (has_wildcard) {
-        safe_eprint("%s Your mask contains wildcard characters (*, ?, [).\n", SYM_WARN);
-        safe_eprint("   To prevent shell expansion, always quote the mask:\n");
-        safe_eprint("       crive %s --mask '%s'\n", cfg->archive_path, cfg->mask.raw_mask);
-    }
-
-    if (mask_parse(&cfg->mask, cfg->mask.raw_mask, NULL, 0) != 0) {
-        safe_eprint("%s Invalid mask pattern: '%s'\n",
-                    SYM_ERR, cfg->mask.raw_mask);
-        return -1;
-    }
-}
 
     /* Length sanity */
     if (cfg->min_length > cfg->max_length) {
@@ -1466,31 +1475,31 @@ static int run_cracking_session(config_t *cfg) {
         display_wordlist_info(cfg);
     }
 
-  /* ----- 7z dependency check ----- */
-bool need_7z = false;
-if (cfg->archive_type == ARCHIVE_7Z) {
-    need_7z = true;
-} else if (cfg->archive_type == ARCHIVE_ZIP) {
-    /* For ZIP, we need 7z only if the compression method is not STORED (0) */
-    const struct zip_ctx *z = &archive->zip;
-    if (z->method != 0) {   /* 0 = stored (no compression) */
+    /* ----- 7z dependency check ----- */
+    bool need_7z = false;
+    if (cfg->archive_type == ARCHIVE_7Z) {
         need_7z = true;
+    } else if (cfg->archive_type == ARCHIVE_ZIP) {
+        /* For ZIP, we need 7z only if the compression method is not STORED (0) */
+        const struct zip_ctx *z = &archive->zip;
+        if (z->method != 0) {   /* 0 = stored (no compression) */
+            need_7z = true;
+        }
     }
-}
 
-if (need_7z && !command_exists("7z")) {
-    safe_eprint("\n%s 7z (p7zip) is required to verify passwords for this archive.\n"
-                "   Please install p7zip:\n"
-                "     Termux : pkg install p7zip\n"
-                "     Debian : apt install p7zip-full\n"
-                "     Arch   : pacman -S p7zip\n"
-                "     macOS  : brew install p7zip\n\n",
-                SYM_ERR);
-    archive_ctx_free(archive);
-    free(archive);
-    return EXIT_FAILURE;
-}
-/* ----- end dependency check ----- */
+    if (need_7z && !command_exists("7z")) {
+        safe_eprint("\n%s 7z (p7zip) is required to verify passwords for this archive.\n"
+                    "   Please install p7zip:\n"
+                    "     Termux : pkg install p7zip\n"
+                    "     Debian : apt install p7zip-full\n"
+                    "     Arch   : pacman -S p7zip\n"
+                    "     macOS  : brew install p7zip\n\n",
+                    SYM_ERR);
+        archive_ctx_free(archive);
+        free(archive);
+        return EXIT_FAILURE;
+    }
+    /* ----- end dependency check ----- */
 
     /* Display config summary */
     display_config_summary(cfg);
