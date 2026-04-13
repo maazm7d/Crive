@@ -1,6 +1,6 @@
 ==============================
 PROJECT STRUCTURE & CONTENT
-Generated: Mon Apr 13 07:18:22 UTC 2026
+Generated: Mon Apr 13 08:25:10 UTC 2026
 ==============================
 
 FILE TREE:
@@ -11976,7 +11976,6 @@ static int sz_read_number(sz_reader_t *r, uint64_t *out) {
 static int sz_read_number_unused_wrapper(sz_reader_t *r, uint64_t *out) {
     return sz_read_number(r, out);
 }
-(void)sz_read_number_unused_wrapper;
 
 static bool sz_parse_aes_props(const uint8_t *props, size_t props_len,
                                 struct sz_ctx *ctx) {
@@ -12615,5 +12614,5 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
  * ============================================================ */
 
 ----------------------------------------
-Dump Completed: Mon Apr 13 07:18:22 UTC 2026
+Dump Completed: Mon Apr 13 08:25:10 UTC 2026
 ----------------------------------------
