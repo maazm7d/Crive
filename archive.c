@@ -1897,7 +1897,8 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
      */
     bool validated = false;
 
-    if (ctx->next_header_crc != 0 &&
+    if (ctx->is_header_encrypted &&
+        ctx->next_header_crc != 0 &&
         ctx->next_header_size > 0 &&
         ctx->next_header_size <= (uint64_t)(4 * MB)) {
 
