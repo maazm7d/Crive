@@ -57,7 +57,7 @@ void log_message(log_level_t level, const char *fmt, ...);
 #define MAX_RULES            4096
 #define BATCH_MAX_SIZE       4096
 #define DEFAULT_BATCH_SIZE   1024
-#define ATTEMPT_FLUSH_THRESHOLD 4096ULL
+#define ATTEMPT_FLUSH_THRESHOLD 32ULL
 #define SPEED_SAMPLE_WINDOW  8
 #define PROGRESS_UPDATE_MS   250
 #define KB                   (1024ULL)

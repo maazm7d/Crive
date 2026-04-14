@@ -1698,7 +1698,7 @@ int sz_parse(struct sz_ctx *ctx, const char *path) {
     size_t         hdr_size = (size_t)ctx->next_header_size;
 
     if (hdr_data[0] == SZ_ID_ENCODED_HEADER) {
-        ctx->is_header_encrypted = false;
+        ctx->is_header_encrypted = true;
         log_debug("sz_parse: encoded header detected");
         if (sz_scan_for_aes_coder(hdr_data, hdr_size, ctx)) {
             ctx->has_encrypted_streams = true;
@@ -1867,9 +1867,6 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
     if (UNLIKELY(!ctx || !ctx->parsed)) return false;
     if (UNLIKELY(!ctx->has_encrypted_streams)) return false;
 
-    if (sz_validate_password_cli(archive_path, password))
-        return true;
-
     uint8_t aes_key[32];
     sz_derive_key(password,
                   ctx->aes_salt_len > 0 ? ctx->aes_salt : NULL,
@@ -1951,23 +1948,28 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
         }
     }
 
-    if (!validated) {
+    bool maybe_ok = false;
+    if (validated) {
+        maybe_ok = true;
+    } else {
         uint8_t first = dec_block[0];
-        bool valid_id = (first == SZ_ID_HEADER          ||
-                         first == SZ_ID_ENCODED_HEADER   ||
-                         first == SZ_ID_END              ||
-                         first == SZ_ID_PACK_INFO        ||
-                         first == SZ_ID_UNPACK_INFO      ||
-                         first == SZ_ID_MAIN_STREAMS_INFO);
-
-        volatile uint8_t *vk = (volatile uint8_t *)aes_key;
-        for (int i = 0; i < 32; i++) vk[i] = 0;
-        return valid_id;
+        maybe_ok = (first == SZ_ID_HEADER          ||
+                    first == SZ_ID_ENCODED_HEADER   ||
+                    first == SZ_ID_END              ||
+                    first == SZ_ID_PACK_INFO        ||
+                    first == SZ_ID_UNPACK_INFO      ||
+                    first == SZ_ID_MAIN_STREAMS_INFO);
     }
 
     volatile uint8_t *vk = (volatile uint8_t *)aes_key;
     for (int i = 0; i < 32; i++) vk[i] = 0;
-    return validated;
+
+    if (maybe_ok) {
+        /* Double-confirm with CLI if internal check says OK */
+        return sz_validate_password_cli(archive_path, password);
+    }
+
+    return false;
 }
 
 /* ============================================================
