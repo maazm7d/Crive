@@ -57,7 +57,7 @@ void log_message(log_level_t level, const char *fmt, ...);
 #define MAX_RULES            4096
 #define BATCH_MAX_SIZE       4096
 #define DEFAULT_BATCH_SIZE   1024
-#define ATTEMPT_FLUSH_THRESHOLD 32ULL
+#define ATTEMPT_FLUSH_THRESHOLD 1ULL
 #define SPEED_SAMPLE_WINDOW  8
 #define PROGRESS_UPDATE_MS   250
 #define KB                   (1024ULL)
@@ -810,13 +810,11 @@ static void *worker_thread_fn(void *arg) {
 
             const char *pw = batch.passwords[i];
 
-            /* Update thread status (infrequently) */
-            if (UNLIKELY((ts->attempts & 0xFFULL) == 0)) {
-                size_t pw_len = strlen(pw);
-                if (pw_len >= MAX_PASSWORD_LEN) pw_len = MAX_PASSWORD_LEN - 1;
-                memcpy(ts->current_password, pw, pw_len);
-                ts->current_password[pw_len] = '\0';
-            }
+            /* Update thread status (every attempt for slow attacks) */
+            size_t pw_len = strlen(pw);
+            if (pw_len >= MAX_PASSWORD_LEN) pw_len = MAX_PASSWORD_LEN - 1;
+            memcpy(ts->current_password, pw, pw_len);
+            ts->current_password[pw_len] = '\0';
 
             ts->attempts++;
             local_count++;
@@ -828,15 +826,15 @@ static void *worker_thread_fn(void *arg) {
                 log_debug("Worker %d: found password '%s'", tid, pw);
                 goto done;
             }
-        } /* end for */
 
-        /* Flush local_count periodically */
-        if (local_count >= ATTEMPT_FLUSH_THRESHOLD) {
-            atomic_fetch_add_explicit(&eng->total_attempts,
-                                      (uint_fast64_t)local_count,
-                                      memory_order_relaxed);
-            local_count = 0;
-        }
+            /* Flush local_count frequently to show progress for slow methods */
+            if (local_count >= ATTEMPT_FLUSH_THRESHOLD) {
+                atomic_fetch_add_explicit(&eng->total_attempts,
+                                          (uint_fast64_t)local_count,
+                                          memory_order_relaxed);
+                local_count = 0;
+            }
+        } /* end for */
 
         /* Check global limit */
         if (cfg->limit > 0) {
@@ -1810,12 +1808,11 @@ static void *worker_thread_adaptive_fn(void *arg) {
 
             const char *pw = batch.passwords[i];
 
-            if (UNLIKELY((ts->attempts & 0xFFULL) == 0)) {
-                size_t pwlen = strlen(pw);
-                if (pwlen >= MAX_PASSWORD_LEN) pwlen = MAX_PASSWORD_LEN - 1;
-                memcpy(ts->current_password, pw, pwlen);
-                ts->current_password[pwlen] = '\0';
-            }
+            /* Update thread status */
+            size_t pwlen = strlen(pw);
+            if (pwlen >= MAX_PASSWORD_LEN) pwlen = MAX_PASSWORD_LEN - 1;
+            memcpy(ts->current_password, pw, pwlen);
+            ts->current_password[pwlen] = '\0';
 
             ts->attempts++;
             local_count++;
@@ -1825,9 +1822,17 @@ static void *worker_thread_adaptive_fn(void *arg) {
                 ts->found = true;
                 goto done;
             }
+
+            /* Flush local_count frequently */
+            if (local_count >= ATTEMPT_FLUSH_THRESHOLD) {
+                atomic_fetch_add_explicit(&eng->total_attempts,
+                                           (uint_fast64_t)local_count,
+                                           memory_order_relaxed);
+                local_count = 0;
+            }
         }
 
-        if (local_count >= ATTEMPT_FLUSH_THRESHOLD || n < batch.capacity) {
+        if (local_count > 0 && (n < batch.capacity)) {
             atomic_fetch_add_explicit(&eng->total_attempts,
                                        (uint_fast64_t)local_count,
                                        memory_order_relaxed);
