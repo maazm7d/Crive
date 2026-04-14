@@ -1965,8 +1965,9 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
     volatile uint8_t *vk = (volatile uint8_t *)aes_key;
     for (int i = 0; i < 32; i++) vk[i] = 0;
 
-    if (maybe_ok) {
-        /* Double-confirm with CLI if internal check says OK */
+    if (maybe_ok || !ctx->is_header_encrypted) {
+        /* Double-confirm with CLI if internal check says OK,
+         * or if header is plain (must check CLI for stream encryption). */
         return sz_validate_password_cli(archive_path, password);
     }
 
@@ -2073,6 +2074,12 @@ void archive_print_info(const archive_ctx_t *ctx, bool no_color) {
                     (unsigned long long)(1ULL << s->num_cycles_power),
                     c_r);
             fprintf(stderr,"  %sSalt Len:%s %s%d%s\n",c_l,c_r,c_v,s->aes_salt_len,c_r);
+            if (!s->is_header_encrypted && s->has_encrypted_streams) {
+                const char *c_w = no_color ? "" : "\033[93m";
+                fprintf(stderr, "\n  %s[!] Warning: Plain header with encrypted streams detected.%s\n", c_w, c_r);
+                fprintf(stderr, "      Cracking will be slow as every attempt requires CLI verification.%s\n", c_r);
+                fprintf(stderr, "      Use -mhe=on when creating 7z archives for maximum speed.%s\n", c_r);
+            }
             break;
         }
         default:
