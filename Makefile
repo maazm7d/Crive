@@ -546,6 +546,11 @@ $(TESTDIR)/test.7z: | $(TESTDIR)
 # Create test wordlist
 $(TESTDIR)/wordlist.txt: | $(TESTDIR)
 	@echo "Creating test wordlist..."
+	@printf '123456\ntest123\nqwerty\nletmein\ndragon\nadmin\n' > $@
+	@echo "Created: $@"
+
+$(TESTDIR)/wordlist_rar.txt: | $(TESTDIR)
+	@echo "Creating test wordlist for RAR..."
 	@printf 'password\n123456\ntest123\nqwerty\nletmein\ndragon\nadmin\n' > $@
 	@echo "Created: $@"
 
@@ -584,7 +589,7 @@ $(TESTDIR)/test_rar5.rar: | $(TESTDIR)
 	@echo "Created: $@"
 
 # Full test suite
-test: all $(TESTDIR)/test.zip $(TESTDIR)/test.7z $(TESTDIR)/test_rar3.rar $(TESTDIR)/test_rar5.rar $(TESTDIR)/wordlist.txt
+test: all $(TESTDIR)/test.zip $(TESTDIR)/test.7z $(TESTDIR)/test_rar3.rar $(TESTDIR)/test_rar5.rar $(TESTDIR)/wordlist.txt $(TESTDIR)/wordlist_rar.txt
 	@echo ""
 	@echo "============================================"
 	@echo " Running crive test suite"
@@ -662,9 +667,8 @@ test: all $(TESTDIR)/test.zip $(TESTDIR)/test.7z $(TESTDIR)/test_rar3.rar $(TEST
 	\
 	echo ""; \
 	echo "[TEST 6] RAR5 dictionary attack (should find 'password')"; \
-	echo "password" >> $(TESTDIR)/wordlist.txt; \
 	if $(TARGET) $(TESTDIR)/test_rar5.rar \
-	    --wordlist $(TESTDIR)/wordlist.txt \
+	    --wordlist $(TESTDIR)/wordlist_rar.txt \
 	    --threads 2 \
 	    --no-color \
 	    --no-progress \

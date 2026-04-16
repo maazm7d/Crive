@@ -29,14 +29,6 @@
  * FORWARD DECLARATIONS FROM utils.c
  * ============================================================ */
 
-typedef enum {
-    LOG_DEBUG   = 0,
-    LOG_INFO    = 1,
-    LOG_WARNING = 2,
-    LOG_ERROR   = 3,
-    LOG_SILENT  = 4,
-} log_level_t;
-
 void log_message(log_level_t level, const char *fmt, ...);
 #define log_debug(fmt, ...)  log_message(LOG_DEBUG,   fmt, ##__VA_ARGS__)
 #define log_info(fmt, ...)   log_message(LOG_INFO,    fmt, ##__VA_ARGS__)
@@ -67,16 +59,6 @@ void log_message(log_level_t level, const char *fmt, ...);
  * STRUCT FORWARD DECLARATIONS
  * ============================================================ */
 
-typedef enum {
-    ATTACK_NONE         = 0,
-    ATTACK_DICTIONARY   = 1,
-    ATTACK_BRUTEFORCE   = 2,
-    ATTACK_MASK         = 3,
-    ATTACK_HYBRID       = 4,
-    ATTACK_RULE         = 5,
-    ATTACK_BENCHMARK    = 6,
-    ATTACK_MAX
-} attack_mode_t;
 
 typedef struct {
     char    chars[MAX_CHARSET_LEN];
@@ -113,24 +95,6 @@ typedef struct {
     char        prefix_charset[MAX_CHARSET_LEN];
 } hybrid_config_t;
 
-typedef enum {
-    RULE_APPEND_DIGIT   = 0,
-    RULE_PREPEND_DIGIT  = 1,
-    RULE_UPPERCASE_ALL  = 2,
-    RULE_LOWERCASE_ALL  = 3,
-    RULE_CAPITALIZE     = 4,
-    RULE_REVERSE        = 5,
-    RULE_DUPLICATE      = 6,
-    RULE_LEET_SPEAK     = 7,
-    RULE_APPEND_YEAR    = 8,
-    RULE_APPEND_SPECIAL = 9,
-    RULE_TOGGLE_CASE    = 10,
-    RULE_ROTATE_LEFT    = 11,
-    RULE_ROTATE_RIGHT   = 12,
-    RULE_REFLECT        = 13,
-    RULE_STRIP_VOWELS   = 14,
-    RULE_MAX
-} rule_type_t;
 
 typedef struct {
     rule_type_t type;
@@ -953,13 +917,6 @@ static void *bench_worker_fn(void *arg) {
  * Sets up thread pool, launches workers, monitors progress.
  * Returns attack_result_t.
  */
-typedef enum {
-    ATTACK_RESULT_NOT_FOUND = 0,
-    ATTACK_RESULT_FOUND     = 1,
-    ATTACK_RESULT_EXHAUSTED = 2,
-    ATTACK_RESULT_ERROR     = 3,
-    ATTACK_RESULT_ABORTED   = 4,
-} attack_result_t;
 
 attack_result_t engine_run(const config_t *cfg,
                             archive_ctx_t *master_archive,

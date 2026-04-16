@@ -19,6 +19,52 @@ typedef enum {
     ARCHIVE_MAX
 } archive_type_t;
 
+typedef enum {
+    ATTACK_NONE         = 0,
+    ATTACK_DICTIONARY   = 1,
+    ATTACK_BRUTEFORCE   = 2,
+    ATTACK_MASK         = 3,
+    ATTACK_HYBRID       = 4,
+    ATTACK_RULE         = 5,
+    ATTACK_BENCHMARK    = 6,
+    ATTACK_MAX
+} attack_mode_t;
+
+typedef enum {
+    LOG_DEBUG   = 0,
+    LOG_INFO    = 1,
+    LOG_WARNING = 2,
+    LOG_ERROR   = 3,
+    LOG_SILENT  = 4,
+} log_level_t;
+
+typedef enum {
+    ATTACK_RESULT_NOT_FOUND = 0,
+    ATTACK_RESULT_FOUND     = 1,
+    ATTACK_RESULT_EXHAUSTED = 2,
+    ATTACK_RESULT_ERROR     = 3,
+    ATTACK_RESULT_ABORTED   = 4,
+} attack_result_t;
+
+typedef enum {
+    RULE_APPEND_DIGIT       = 0,
+    RULE_PREPEND_DIGIT      = 1,
+    RULE_UPPERCASE_ALL      = 2,
+    RULE_LOWERCASE_ALL      = 3,
+    RULE_CAPITALIZE         = 4,
+    RULE_REVERSE            = 5,
+    RULE_DUPLICATE          = 6,
+    RULE_LEET_SPEAK         = 7,
+    RULE_APPEND_YEAR        = 8,
+    RULE_APPEND_SPECIAL     = 9,
+    RULE_TOGGLE_CASE        = 10,
+    RULE_ROTATE_LEFT        = 11,
+    RULE_ROTATE_RIGHT       = 12,
+    RULE_REFLECT            = 13,
+    RULE_STRIP_VOWELS       = 14,
+    RULE_MAX
+} rule_type_t;
+
 /* -------------------------------------------------------------------------
  * ZIP context structure – full definition
  * ------------------------------------------------------------------------- */
@@ -26,6 +72,7 @@ typedef struct zip_ctx {
     const uint8_t   *data;
     size_t           data_size;
     bool             mmap_used;
+    bool             is_clone;
     int              fd;
 
     char             archive_path[MAX_PATH_LEN];   /* archive path for CLI verification */
@@ -116,6 +163,7 @@ typedef struct sz_ctx {
     const uint8_t   *data;
     size_t           data_size;
     bool             mmap_used;
+    bool             is_clone;
     int              fd;
 
     bool             parsed;
@@ -142,6 +190,7 @@ typedef struct rar_ctx {
     const uint8_t   *data;
     size_t           data_size;
     bool             mmap_used;
+    bool             is_clone;
     int              fd;
 
     bool             parsed;
@@ -188,6 +237,11 @@ int  archive_ctx_clone(archive_ctx_t *dst, const archive_ctx_t *src);
 void archive_print_info(const archive_ctx_t *ctx, bool no_color);
 archive_type_t detect_archive_type(const char *path);
 bool command_exists(const char *cmd);
-void secure_memzero(void *ptr, size_t len);
+
+static inline void secure_memzero(void *ptr, size_t len) {
+    if (!ptr || len == 0) return;
+    volatile uint8_t *p = (volatile uint8_t *)ptr;
+    while (len--) *p++ = 0;
+}
 
 #endif /* ARCHIVE_H */

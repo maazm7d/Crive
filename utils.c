@@ -29,6 +29,8 @@
 #include <locale.h>
 #include <stddef.h>
 
+#include "archive.h"
+
 /* ============================================================
  * VERSION AND BUILD INFO
  * ============================================================ */
@@ -204,17 +206,6 @@
  * ATTACK MODE ENUM
  * ============================================================ */
 
-typedef enum {
-    ATTACK_NONE         = 0,
-    ATTACK_DICTIONARY   = 1,
-    ATTACK_BRUTEFORCE   = 2,
-    ATTACK_MASK         = 3,
-    ATTACK_HYBRID       = 4,
-    ATTACK_RULE         = 5,
-    ATTACK_BENCHMARK    = 6,
-    ATTACK_MAX
-} attack_mode_t;
-
 static const char *attack_mode_names[] = {
     [ATTACK_NONE]       = "None",
     [ATTACK_DICTIONARY] = "Dictionary",
@@ -229,31 +220,12 @@ static const char *attack_mode_names[] = {
  * ARCHIVE TYPE ENUM
  * ============================================================ */
 
-typedef enum {
-    ARCHIVE_UNKNOWN = 0,
-    ARCHIVE_ZIP     = 1,
-    ARCHIVE_7Z      = 2,
-    ARCHIVE_RAR     = 3,
-    ARCHIVE_MAX
-} archive_type_t;
-
 static const char *archive_type_names[] = {
     [ARCHIVE_UNKNOWN] = "Unknown",
     [ARCHIVE_ZIP]     = "ZIP",
     [ARCHIVE_7Z]      = "7-Zip",
+    [ARCHIVE_RAR]     = "RAR",
 };
-
-/* ============================================================
- * LOG LEVEL ENUM
- * ============================================================ */
-
-typedef enum {
-    LOG_DEBUG   = 0,
-    LOG_INFO    = 1,
-    LOG_WARNING = 2,
-    LOG_ERROR   = 3,
-    LOG_SILENT  = 4,
-} log_level_t;
 
 /* ============================================================
  * CHARSET SPEC STRUCT
@@ -308,24 +280,6 @@ typedef struct {
  * RULE STRUCT
  * ============================================================ */
 
-typedef enum {
-    RULE_APPEND_DIGIT       = 0,
-    RULE_PREPEND_DIGIT      = 1,
-    RULE_UPPERCASE_ALL      = 2,
-    RULE_LOWERCASE_ALL      = 3,
-    RULE_CAPITALIZE         = 4,
-    RULE_REVERSE            = 5,
-    RULE_DUPLICATE          = 6,
-    RULE_LEET_SPEAK         = 7,
-    RULE_APPEND_YEAR        = 8,
-    RULE_APPEND_SPECIAL     = 9,
-    RULE_TOGGLE_CASE        = 10,
-    RULE_ROTATE_LEFT        = 11,
-    RULE_ROTATE_RIGHT       = 12,
-    RULE_REFLECT            = 13,
-    RULE_STRIP_VOWELS       = 14,
-    RULE_MAX
-} rule_type_t;
 
 static const char *rule_type_names[] __attribute__((unused)) = {
     [RULE_APPEND_DIGIT]     = "append_digit",
@@ -1347,11 +1301,6 @@ FORCE_INLINE size_t safe_memcpy(void *dst, size_t dst_size,
     return copy_len;
 }
 
-/* Secure memset (compiler won't optimize away) */
-void secure_memzero(void *ptr, size_t len) {
-    volatile uint8_t *p = (volatile uint8_t *)ptr;
-    while (len--) *p++ = 0;
-}
 
 /* ============================================================
  * STRING UTILITIES

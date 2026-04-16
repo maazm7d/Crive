@@ -29,13 +29,6 @@
 #include "archive.h"
 
 /* Forward declarations from utils.c */
-typedef enum {
-    LOG_DEBUG   = 0,
-    LOG_INFO    = 1,
-    LOG_WARNING = 2,
-    LOG_ERROR   = 3,
-    LOG_SILENT  = 4,
-} log_level_t;
 
 void log_message(log_level_t level, const char *fmt, ...);
 #define log_debug(fmt, ...)   log_message(LOG_DEBUG,   fmt, ##__VA_ARGS__)
@@ -1238,7 +1231,7 @@ fail:
 
 void zip_ctx_free(struct zip_ctx *ctx) {
     if (!ctx) return;
-    if (ctx->data) {
+    if (ctx->data && !ctx->is_clone) {
         if (ctx->mmap_used)
             munmap((void *)ctx->data, ctx->data_size);
         else
@@ -1923,7 +1916,7 @@ fail:
 
 void sz_ctx_free(struct sz_ctx *ctx) {
     if (!ctx) return;
-    if (ctx->data) {
+    if (ctx->data && !ctx->is_clone) {
         if (ctx->mmap_used)
             munmap((void *)ctx->data, ctx->data_size);
         else
@@ -2087,13 +2080,14 @@ int rar_parse(struct rar_ctx *ctx, const char *path) {
     for (size_t i = 0; i < scan_limit; i++) {
         if (ctx->data[i] == 0x52 && ctx->data[i+1] == 0x61 &&
             ctx->data[i+2] == 0x72 && ctx->data[i+3] == 0x21) {
-            if (i + 7 <= ctx->data_size &&
-                ctx->data[i+4] == 0x1A && ctx->data[i+5] == 0x07 && ctx->data[i+6] == 0x01) {
+            if (i + 8 <= ctx->data_size &&
+                ctx->data[i+4] == 0x1A && ctx->data[i+5] == 0x07 && ctx->data[i+6] == 0x01 &&
+                ctx->data[i+7] == 0x00) {
                 ctx->version = 5;
                 sig_pos = i;
                 found_sig = true;
                 break;
-            } else if (i + 6 <= ctx->data_size &&
+            } else if (i + 7 <= ctx->data_size &&
                        ctx->data[i+4] == 0x1A && ctx->data[i+5] == 0x07 && ctx->data[i+6] == 0x00) {
                 ctx->version = 3;
                 sig_pos = i;
@@ -2114,12 +2108,13 @@ int rar_parse(struct rar_ctx *ctx, const char *path) {
         size_t pos = sig_pos + 8;
         while (pos + 7 < ctx->data_size) {
             uint64_t h_size, h_type, h_flags;
-            int n;
+            int n_hsize;
             /* Header CRC is at pos, Header Size starts at pos+4 */
-            n = rar_read_vint(ctx->data + pos + 4, ctx->data_size - pos - 4, &h_size);
-            if (n < 0) break;
-            size_t header_payload_start = pos + 4 + (size_t)n;
+            n_hsize = rar_read_vint(ctx->data + pos + 4, ctx->data_size - pos - 4, &h_size);
+            if (n_hsize < 0) break;
+            size_t header_payload_start = pos + 4 + (size_t)n_hsize;
 
+            int n;
             n = rar_read_vint(ctx->data + header_payload_start, ctx->data_size - header_payload_start, &h_type);
             if (n < 0) break;
             size_t flags_pos = header_payload_start + (size_t)n;
@@ -2138,6 +2133,8 @@ int rar_parse(struct rar_ctx *ctx, const char *path) {
                 enc_pos += (size_t)n;
 
                 if (enc_pos + 17 > ctx->data_size) break;
+                /* Limit exponent to avoid undefined behavior in 1U << ctx->data[enc_pos] */
+                if (ctx->data[enc_pos] >= 32) break;
                 ctx->iterations = 1U << ctx->data[enc_pos++];
                 memcpy(ctx->salt, ctx->data + enc_pos, 16);
                 enc_pos += 16;
@@ -2151,7 +2148,7 @@ int rar_parse(struct rar_ctx *ctx, const char *path) {
                 ctx->is_encrypted = true;
                 break;
             }
-            pos += 4 + (size_t)n + (size_t)h_size;
+            pos += 4 + (size_t)n_hsize + (size_t)h_size;
         }
     } else {
         size_t pos = sig_pos + 7;
@@ -2196,14 +2193,20 @@ int rar_parse(struct rar_ctx *ctx, const char *path) {
     return 0;
 
 fail:
-    if (ctx->mmap_used) munmap((void *)ctx->data, ctx->data_size);
+    if (ctx->data) {
+        if (ctx->mmap_used)
+            munmap((void *)ctx->data, ctx->data_size);
+        else
+            free((void *)ctx->data);
+        ctx->data = NULL;
+    }
     close(ctx->fd);
     return -1;
 }
 
 void rar_ctx_free(struct rar_ctx *ctx) {
     if (!ctx) return;
-    if (ctx->data) {
+    if (ctx->data && !ctx->is_clone) {
         if (ctx->mmap_used)
             munmap((void *)ctx->data, ctx->data_size);
         else
@@ -2243,10 +2246,12 @@ bool rar_validate_password(const struct rar_ctx *ctx, const char *password, cons
             /* Sig(7) + MainHdr(7) + Salt(8) = 22. Next is encrypted. */
             size_t enc_start = 0;
             /* Re-scan for the salt position to be sure */
-            for (size_t i = 0; i < ctx->data_size - 15; i++) {
+            for (size_t i = 0; i < ctx->data_size - 22; i++) {
                 if (memcmp(ctx->data + i, "Rar!\x1a\x07\x00", 7) == 0) {
-                    uint16_t h_size = le16(ctx->data + i + 5);
-                    enc_start = i + h_size + 8;
+                    /* Read h_size of the Main Header (after the 7-byte signature) */
+                    uint16_t h_size = le16(ctx->data + i + 7 + 5);
+                    /* enc_start skips: Signature(7) + MainHeader(h_size) + Salt(8) */
+                    enc_start = i + 7 + h_size + 8;
                     break;
                 }
             }
@@ -2396,6 +2401,9 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
     bool maybe_ok = false;
     if (validated) {
         maybe_ok = true;
+    } else if (ctx->is_header_encrypted) {
+        /* If header is encrypted and we didn't validate via CRC, it's a fail */
+        maybe_ok = false;
     } else {
         uint8_t first = dec_block[0];
         maybe_ok = (first == SZ_ID_HEADER          ||
@@ -2410,7 +2418,7 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
     for (int i = 0; i < 32; i++) vk[i] = 0;
 
     if (maybe_ok) {
-        /* Double-confirm with CLI if internal check says OK */
+        /* Double-confirm with CLI if internal check says OK or if no header encryption */
         return sz_validate_password_cli(archive_path, password);
     }
 
@@ -2471,13 +2479,13 @@ int archive_ctx_clone(archive_ctx_t *dst, const archive_ctx_t *src) {
     memcpy(dst, src, sizeof(*dst));
 
     if (src->type == ARCHIVE_ZIP) {
-        dst->zip.mmap_used = false;
+        dst->zip.is_clone  = true;
         dst->zip.fd        = -1;
     } else if (src->type == ARCHIVE_7Z) {
-        dst->sz.mmap_used = false;
-        dst->sz.fd        = -1;
+        dst->sz.is_clone   = true;
+        dst->sz.fd         = -1;
     } else if (src->type == ARCHIVE_RAR) {
-        dst->rar.mmap_used = false;
+        dst->rar.is_clone  = true;
         dst->rar.fd        = -1;
     }
     return 0;

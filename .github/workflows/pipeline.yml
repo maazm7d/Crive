@@ -32,7 +32,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential gcc clang make \
-            zip p7zip-full valgrind
+            zip p7zip-full unrar valgrind
 
       - name: System info
         run: |
@@ -62,7 +62,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y zip p7zip-full
+          sudo apt-get install -y zip p7zip-full unrar
 
       - name: Build (debug for max logs)
         run: |
@@ -99,15 +99,15 @@ jobs:
 
           echo "===== CREATE 7Z ====="
           echo "data" > file.txt
-          7z a -psecret7z test.7z file.txt
+          7z a -psecret7z -mhe=on test.7z file.txt
 
           echo "===== CREATE WORDLIST ====="
-          echo "badpass" > wordlist.txt
-          echo "secret7z" >> wordlist.txt
+          echo "badpass" > wordlist_7z.txt
+          echo "secret7z" >> wordlist_7z.txt
 
           echo "===== RUN CRIVE ====="
           ./build/bin/crive test.7z \
-            --wordlist wordlist.txt \
+            --wordlist wordlist_7z.txt \
             --verbose \
             > 7z.log 2>&1 || true
 
@@ -116,6 +116,102 @@ jobs:
 
           echo "===== VALIDATION ====="
           grep -q "secret7z" 7z.log
+
+      - name: RAR5 Test (Ultra Verbose)
+        run: |
+          set -x
+
+          echo "===== CREATE RAR5 ====="
+          # We use the internal generator since unrar doesn't create archives
+          cat <<EOF > gen_rar5.c
+          #include <stdio.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <stdlib.h>
+          #include <openssl/hmac.h>
+          #include <openssl/sha.h>
+
+          void rar5_derive_values(const char *password, const uint8_t *salt, uint32_t iterations, uint8_t check[8]) {
+              uint8_t U[32], T[32];
+              size_t pass_len = strlen(password);
+              uint8_t salt_blk[20]; memcpy(salt_blk, salt, 16);
+              salt_blk[16]=0; salt_blk[17]=0; salt_blk[18]=0; salt_blk[19]=1;
+              unsigned int md_len;
+              HMAC(EVP_sha256(), password, pass_len, salt_blk, 20, U, &md_len);
+              memcpy(T, U, 32);
+              for (uint32_t i = 1; i < iterations; i++) {
+                  HMAC(EVP_sha256(), password, pass_len, U, 32, U, &md_len);
+                  for (int j = 0; j < 32; j++) T[j] ^= U[j];
+              }
+              for (uint32_t i = 0; i < 16; i++) HMAC(EVP_sha256(), password, pass_len, U, 32, U, &md_len);
+              memset(T, 0, 32);
+              for (uint32_t i = 0; i < 16; i++) {
+                  HMAC(EVP_sha256(), password, pass_len, U, 32, U, &md_len);
+                  for (int j = 0; j < 32; j++) T[j] ^= U[j];
+              }
+              memcpy(check, T, 8);
+          }
+
+          int write_vint(uint8_t *p, uint64_t val) {
+              int n = 0;
+              while (val >= 0x80) { p[n++] = (uint8_t)(val | 0x80); val >>= 7; }
+              p[n++] = (uint8_t)val;
+              return n;
+          }
+
+          int main() {
+              uint8_t salt[16] = {0};
+              uint8_t check[8];
+              rar5_derive_values("password", salt, 1024, check);
+              uint8_t check_full[12];
+              memcpy(check_full, check, 8);
+              SHA256_CTX ctx;
+              SHA256_Init(&ctx);
+              SHA256_Update(&ctx, check, 8);
+              uint8_t digest[32];
+              SHA256_Final(digest, &ctx);
+              memcpy(check_full + 8, digest, 4);
+
+              FILE *f = fopen("test.rar", "wb");
+              fwrite("Rar!\x1a\x07\x01\x00", 1, 8, f);
+              uint8_t enc_hdr[64];
+              int p = 0;
+              p += write_vint(enc_hdr + p, 0); /* enc_ver */
+              p += write_vint(enc_hdr + p, 1); /* enc_flags: check data present */
+              enc_hdr[p++] = 10; /* 2^10 = 1024 */
+              memcpy(enc_hdr + p, salt, 16); p += 16;
+              memcpy(enc_hdr + p, check_full, 12); p += 12;
+              uint8_t head[128];
+              int hp = 0;
+              uint32_t crc = 0;
+              memcpy(head, &crc, 4); hp += 4;
+              hp += write_vint(head + hp, p); /* h_size */
+              hp += write_vint(head + hp, 4); /* h_type: Encryption Header */
+              hp += write_vint(head + hp, 0); /* h_flags */
+              memcpy(head + hp, enc_hdr, p); hp += p;
+              fwrite(head, 1, hp, f);
+              fclose(f);
+              return 0;
+          }
+          EOF
+          gcc gen_rar5.c -o gen_rar5 -lcrypto
+          ./gen_rar5
+
+          echo "===== CREATE WORDLIST ====="
+          echo "wrong" > wordlist_rar.txt
+          echo "password" >> wordlist_rar.txt
+
+          echo "===== RUN CRIVE ====="
+          ./build/bin/crive test.rar \
+            --wordlist wordlist_rar.txt \
+            --verbose \
+            > rar.log 2>&1 || true
+
+          echo "===== FULL LOG ====="
+          cat rar.log
+
+          echo "===== VALIDATION ====="
+          grep -q "password" rar.log
 
       - name: Benchmark (Verbose)
         run: |
