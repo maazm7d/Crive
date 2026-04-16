@@ -2341,71 +2341,13 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
                      dec_block,
                      AES_BLOCK_SIZE);
 
-    /*
-     * ── 7Z CRC32 validation of decrypted header ──
-     */
-    bool validated = false;
-
-    if (ctx->is_header_encrypted &&
-        ctx->next_header_crc != 0 &&
-        ctx->next_header_size > 0 &&
-        ctx->next_header_size <= (uint64_t)(4 * MB)) {
-
-        size_t hdr_sz = (size_t)ctx->next_header_size;
-        size_t aes_len = (hdr_sz + AES_BLOCK_SIZE - 1) & ~(size_t)(AES_BLOCK_SIZE - 1);
-
-        size_t hdr_file_offset = sizeof(sz_signature_header_t) +
-                                  (size_t)ctx->next_header_offset;
-
-        if (ctx->data != NULL &&
-            hdr_file_offset + hdr_sz <= ctx->data_size) {
-
-            uint8_t *dec_hdr = (uint8_t *)malloc(aes_len);
-            if (dec_hdr) {
-                uint8_t *enc_padded = (uint8_t *)malloc(aes_len);
-                if (enc_padded) {
-                    memcpy(enc_padded,
-                           ctx->data + hdr_file_offset,
-                           hdr_sz);
-                    if (aes_len > hdr_sz)
-                        memset(enc_padded + hdr_sz, 0, aes_len - hdr_sz);
-
-                    aes_cbc_decrypt(&aes, iv,
-                                     enc_padded,
-                                     dec_hdr,
-                                     aes_len);
-                    free(enc_padded);
-
-                    uint32_t computed_crc = crc32_full(dec_hdr, hdr_sz);
-                    free(dec_hdr);
-
-                    if (computed_crc == ctx->next_header_crc) {
-                        log_debug("sz_validate: CRC32 match 0x%08X",
-                                  computed_crc);
-                        validated = true;
-                    } else {
-                        log_debug("sz_validate: CRC32 mismatch "
-                                  "computed=0x%08X stored=0x%08X",
-                                  computed_crc, ctx->next_header_crc);
-                        volatile uint8_t *vk = (volatile uint8_t *)aes_key;
-                        for (int i = 0; i < 32; i++) vk[i] = 0;
-                        return false;
-                    }
-                } else {
-                    free(dec_hdr);
-                }
-            }
-        }
-    }
-
+    uint8_t first = dec_block[0];
     bool maybe_ok = false;
-    if (validated) {
-        maybe_ok = true;
-    } else if (ctx->is_header_encrypted) {
-        /* If header is encrypted and we didn't validate via CRC, it's a fail */
-        maybe_ok = false;
+    if (ctx->is_header_encrypted) {
+        /* 7z headers are almost always LZMA compressed.
+         * The standard LZMA properties byte is 0x5D. */
+        maybe_ok = (first == 0x5D);
     } else {
-        uint8_t first = dec_block[0];
         maybe_ok = (first == SZ_ID_HEADER          ||
                     first == SZ_ID_ENCODED_HEADER   ||
                     first == SZ_ID_END              ||

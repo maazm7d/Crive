@@ -1504,7 +1504,7 @@ static int run_cracking_session(config_t *cfg) {
     }
 
     /* Set terminal title */
-    char title[128];
+    char title[MAX_PATH_LEN + 128];
     snprintf(title, sizeof(title), "crive - %s",
              cfg->archive_path[0] ? cfg->archive_path : "benchmark");
     term_set_title(title);

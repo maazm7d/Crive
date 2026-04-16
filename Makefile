@@ -500,7 +500,7 @@ bench: all
 
 # Short benchmark
 bench-quick: all
-	$(TARGET) --benchmark --benchmark-duration 3 \
+	$(TARGET) --benchmark --benchmark 3 \
 	          --threads $(shell nproc 2>/dev/null || echo 4) \
 	          --no-color
 
@@ -693,7 +693,7 @@ test: all $(TESTDIR)/test.zip $(TESTDIR)/test.7z $(TESTDIR)/test_rar3.rar $(TEST
 	echo ""; \
 	echo "[TEST 8] Benchmark mode"; \
 	if $(TARGET) --benchmark \
-	    --benchmark-duration 2 \
+	    --benchmark 2 \
 	    --threads 1 \
 	    --no-color \
 	    --no-progress 2>/dev/null; then \
@@ -713,7 +713,7 @@ test: all $(TESTDIR)/test.zip $(TESTDIR)/test.7z $(TESTDIR)/test_rar3.rar $(TEST
 check: all $(TESTDIR)/wordlist.txt
 	@echo "Running smoke test..."
 	$(TARGET) --benchmark \
-	          --benchmark-duration 1 \
+	          --benchmark 1 \
 	          --threads 1 \
 	          --no-color \
 	          --no-progress
