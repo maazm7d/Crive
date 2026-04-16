@@ -262,6 +262,7 @@ typedef struct {
     uint64_t    total_hashes;
     double      duration_sec;
     int         num_threads;
+    archive_type_t arch_type;
 } benchmark_result_t;
 
 typedef struct {
@@ -529,9 +530,11 @@ static void print_usage(const char *prog) {
         "%sARCHIVE:%s\n"
         "  %s--zip%s                     Force ZIP mode\n"
         "  %s--7z%s                      Force 7-Zip mode\n"
+        "  %s--rar%s                     Force RAR mode\n"
         "  %s--skip <n>%s                Skip first N candidates\n"
         "  %s--limit <n>%s               Stop after N candidates tested\n\n",
         cc(ANSI_BRIGHT_WHITE), cc(ANSI_RESET),
+        cc(ANSI_CYAN), cc(ANSI_RESET),
         cc(ANSI_CYAN), cc(ANSI_RESET),
         cc(ANSI_CYAN), cc(ANSI_RESET),
         cc(ANSI_CYAN), cc(ANSI_RESET),
@@ -599,6 +602,7 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
         /* Archive */
         {"zip",          no_argument,       NULL, 1013},
         {"7z",           no_argument,       NULL, 1014},
+        {"rar",          no_argument,       NULL, 1018},
         {"skip",         required_argument, NULL, 1015},
         {"limit",        required_argument, NULL, 1016},
 
@@ -769,6 +773,11 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
                 cfg->force_archive_type = true;
                 break;
 
+            case 1018: /* --rar */
+                cfg->archive_type       = ARCHIVE_RAR;
+                cfg->force_archive_type = true;
+                break;
+
             case 1015: /* --skip */
                 cfg->skip = strtoull(optarg, NULL, 10);
                 break;
@@ -831,7 +840,7 @@ static int validate_config(config_t *cfg) {
         cfg->archive_type = detect_archive_type(cfg->archive_path);
         if (cfg->archive_type == ARCHIVE_UNKNOWN) {
             safe_eprint("%s Cannot determine archive type for: %s\n"
-                        "   Use --zip or --7z to force type.\n",
+                        "   Use --zip, --7z, or --rar to force type.\n",
                         SYM_ERR, cfg->archive_path);
             return -1;
         }
@@ -948,7 +957,7 @@ static void display_config_summary(const config_t *cfg) {
     if (cfg->archive_path[0]) {
         print_kv("Archive",  cfg->archive_path, nc);
 
-        const char *atype_names[] = {"Unknown","ZIP","7-Zip"};
+        const char *atype_names[] = {"Unknown","ZIP","7-Zip","RAR"};
         const char *atype = (cfg->archive_type < ARCHIVE_MAX)
                             ? atype_names[cfg->archive_type] : "Unknown";
         print_kv("Type", atype, nc);
@@ -1208,6 +1217,8 @@ static int preflight_check(const config_t *cfg, archive_ctx_t *archive) {
         /* ZIP check is implicit - if parse succeeded we have enc header */
     } else if (cfg->archive_type == ARCHIVE_7Z) {
         /* 7Z check is implicit */
+    } else if (cfg->archive_type == ARCHIVE_RAR) {
+        /* RAR check is implicit */
     }
 
     return 0;
@@ -1345,23 +1356,25 @@ static void display_benchmark(const benchmark_result_t *res, bool no_color) {
     print_kv_fmt(nc, "Duration",    "%.1f sec", res->duration_sec);
     print_kv_fmt(nc, "Threads",     "%d",       res->num_threads);
 
-    safe_eprint("\n");
-    safe_eprint("  %sEstimated archive cracking speed:%s\n",
-                cc(CLR_LABEL), cc(ANSI_RESET));
+    if (res->arch_type == ARCHIVE_ZIP) {
+        safe_eprint("\n");
+        safe_eprint("  %sEstimated archive cracking speed:%s\n",
+                    cc(CLR_LABEL), cc(ANSI_RESET));
 
-    /* ZIP estimate */
-    double zip_speed = res->total_speed;
-    char zip_str[32];
-    format_speed(zip_str, sizeof(zip_str), zip_speed);
-    safe_eprint("  %s  ZIP  (PKZIP):  %s%s%s\n",
-                cc(ANSI_DIM), cc(CLR_SPEED), zip_str, cc(ANSI_RESET));
+        /* 7Z estimate (much slower due to key derivation) */
+        double sz_speed = res->total_speed / 50000.0; /* rough estimate */
+        char sz_str[32];
+        format_speed(sz_str, sizeof(sz_str), sz_speed);
+        safe_eprint("  %s  7-Zip (AES):  %s%s%s\n",
+                    cc(ANSI_DIM), cc(CLR_SPEED), sz_str, cc(ANSI_RESET));
 
-    /* 7Z estimate (much slower due to key derivation) */
-    double sz_speed = res->total_speed / 50000.0; /* rough estimate */
-    char sz_str[32];
-    format_speed(sz_str, sizeof(sz_str), sz_speed);
-    safe_eprint("  %s  7-Zip (AES):  %s%s%s\n",
-                cc(ANSI_DIM), cc(CLR_SPEED), sz_str, cc(ANSI_RESET));
+        /* RAR estimate */
+        double rar_speed = res->total_speed / 100000.0; /* even slower */
+        char rar_str[32];
+        format_speed(rar_str, sizeof(rar_str), rar_speed);
+        safe_eprint("  %s  RAR  (AES):  %s%s%s\n",
+                    cc(ANSI_DIM), cc(CLR_SPEED), rar_str, cc(ANSI_RESET));
+    }
 
     safe_eprint("\n");
 }
@@ -1463,6 +1476,28 @@ static int run_cracking_session(config_t *cfg) {
                     SYM_ERR, cfg->archive_path);
         free(archive);
         return EXIT_FAILURE;
+    }
+
+    /* ----- unrar dependency check ----- */
+    if (cfg->archive_type == ARCHIVE_RAR && !command_exists("unrar")) {
+        /* For RAR5 with check data, we don't strictly need unrar */
+        bool need_unrar = true;
+        if (archive->rar.version == 5 && archive->rar.has_check_value) {
+            need_unrar = false;
+        }
+
+        if (need_unrar) {
+            safe_eprint("\n%s unrar is required to verify passwords for this RAR archive.\n"
+                        "   Please install unrar:\n"
+                        "     Termux : pkg install unrar\n"
+                        "     Debian : apt install unrar\n"
+                        "     Arch   : pacman -S unrar\n"
+                        "     macOS  : brew install unrar\n\n",
+                        SYM_ERR);
+            archive_ctx_free(archive);
+            free(archive);
+            return EXIT_FAILURE;
+        }
     }
 
     safe_eprint("%s Archive parsed successfully.\n", SYM_OK);
@@ -1670,7 +1705,7 @@ static void show_version(void) {
         "crive %s\n"
         "Build:    %s %s\n"
         "Platform: %s\n"
-        "Features: ZIP PKZIP, ZIP WinZip-AES, 7-Zip AES-256\n"
+        "Features: ZIP PKZIP, ZIP WinZip-AES, 7-Zip AES-256, RAR3, RAR5\n"
         "Attacks:  Dictionary, Brute-Force, Mask, Hybrid, Rule-Based\n",
         CRIVE_VERSION_STR,
         CRIVE_BUILD_DATE, CRIVE_BUILD_TIME,

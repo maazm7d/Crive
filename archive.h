@@ -15,6 +15,7 @@ typedef enum {
     ARCHIVE_UNKNOWN = 0,
     ARCHIVE_ZIP     = 1,
     ARCHIVE_7Z      = 2,
+    ARCHIVE_RAR     = 3,
     ARCHIVE_MAX
 } archive_type_t;
 
@@ -135,6 +136,33 @@ typedef struct sz_ctx {
 } sz_ctx_t;
 
 /* -------------------------------------------------------------------------
+ * RAR context structure
+ * ------------------------------------------------------------------------- */
+typedef struct rar_ctx {
+    const uint8_t   *data;
+    size_t           data_size;
+    bool             mmap_used;
+    int              fd;
+
+    bool             parsed;
+    int              version;               /* 3 or 5 */
+
+    bool             is_encrypted;
+    bool             is_header_encrypted;
+
+    uint8_t          salt[16];
+    int              salt_len;
+    uint32_t         iterations;
+
+    /* RAR5 specific */
+    uint8_t          check_value[12];       /* for RAR5 password validation */
+    bool             has_check_value;
+
+    /* RAR3 specific */
+    uint8_t          iv[16];
+} rar_ctx_t;
+
+/* -------------------------------------------------------------------------
  * Unified archive context (visible to engine.c and main.c)
  * ------------------------------------------------------------------------- */
 struct archive_ctx {
@@ -143,6 +171,7 @@ struct archive_ctx {
     union {
         zip_ctx_t    zip;
         sz_ctx_t     sz;
+        rar_ctx_t    rar;
     };
     uint8_t          scratch[4096];
 };
@@ -158,5 +187,7 @@ bool archive_validate_password(const archive_ctx_t *ctx, const char *password);
 int  archive_ctx_clone(archive_ctx_t *dst, const archive_ctx_t *src);
 void archive_print_info(const archive_ctx_t *ctx, bool no_color);
 archive_type_t detect_archive_type(const char *path);
+bool command_exists(const char *cmd);
+void secure_memzero(void *ptr, size_t len);
 
 #endif /* ARCHIVE_H */

@@ -911,9 +911,16 @@ static void *bench_worker_fn(void *arg) {
                     k2 = bench_hash((char[]){(char)(k1>>24),0}, k2);
                 }
                 result ^= k0 ^ k1 ^ k2;
+            } else if (ba->archive_type == ARCHIVE_RAR) {
+                /* RAR benchmark uses heavy KDF simulation */
+                for (int j = 0; j < 1000; j++) {
+                    result ^= bench_hash(pw, result);
+                }
             } else {
-                /* Simulate SHA256 iteration (more expensive) */
-                result ^= bench_hash(pw, result);
+                /* 7z benchmark (medium KDF) */
+                for (int j = 0; j < 100; j++) {
+                    result ^= bench_hash(pw, result);
+                }
             }
 
             count++;
@@ -1206,6 +1213,7 @@ typedef struct {
     uint64_t    total_hashes;
     double      duration_sec;
     int         num_threads;
+    archive_type_t arch_type;
 } benchmark_result_t;
 
 benchmark_result_t engine_benchmark(const config_t *cfg,
@@ -1296,6 +1304,7 @@ benchmark_result_t engine_benchmark(const config_t *cfg,
     if (res.peak_speed < res.total_speed) {
         res.peak_speed = res.total_speed;
     }
+    res.arch_type = arch_type;
 
     free(workers);
     engine_state_cleanup_local(&eng);

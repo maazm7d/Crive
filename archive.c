@@ -415,6 +415,142 @@ static void sha256(const uint8_t *data, size_t len, uint8_t digest[32]) {
     sha256_final(&ctx, digest);
 }
 
+static void hmac_sha256(const uint8_t *key, size_t key_len,
+                        const uint8_t *data, size_t data_len,
+                        uint8_t out[32]) {
+    uint8_t ipad[64], opad[64];
+    uint8_t key_hash[32];
+    const uint8_t *k = key;
+    size_t klen = key_len;
+
+    if (klen > 64) {
+        sha256(key, key_len, key_hash);
+        k    = key_hash;
+        klen = 32;
+    }
+
+    memset(ipad, 0x36, 64);
+    memset(opad, 0x5C, 64);
+
+    for (size_t i = 0; i < klen; i++) {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+
+    sha256_ctx_t ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, ipad, 64);
+    sha256_update(&ctx, data, data_len);
+    sha256_final(&ctx, out);
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, opad, 64);
+    sha256_update(&ctx, out, 32);
+    sha256_final(&ctx, out);
+}
+
+static void pbkdf2_sha256(const uint8_t *password, size_t pass_len,
+                          const uint8_t *salt, size_t salt_len,
+                          uint32_t iterations,
+                          uint8_t *out, size_t out_len) {
+    uint32_t block_num = 0;
+    size_t   done      = 0;
+
+    uint8_t salt_blk[128];
+    if (salt_len > sizeof(salt_blk) - 4)
+        salt_len = sizeof(salt_blk) - 4;
+    memcpy(salt_blk, salt, salt_len);
+
+    while (done < out_len) {
+        block_num++;
+        salt_blk[salt_len + 0] = (uint8_t)(block_num >> 24);
+        salt_blk[salt_len + 1] = (uint8_t)(block_num >> 16);
+        salt_blk[salt_len + 2] = (uint8_t)(block_num >>  8);
+        salt_blk[salt_len + 3] = (uint8_t)(block_num);
+
+        uint8_t U[32], T[32];
+        hmac_sha256(password, pass_len, salt_blk, salt_len + 4, U);
+        memcpy(T, U, 32);
+
+        for (uint32_t i = 1; i < iterations; i++) {
+            hmac_sha256(password, pass_len, U, 32, U);
+            for (int j = 0; j < 32; j++) T[j] ^= U[j];
+        }
+
+        size_t copy = (out_len - done > 32) ? 32 : (out_len - done);
+        memcpy(out + done, T, copy);
+        done += copy;
+    }
+    secure_memzero(salt_blk, sizeof(salt_blk));
+}
+
+static void rar3_derive_key(const char *password, const uint8_t *salt, uint8_t key[16], uint8_t iv[16]) {
+    uint8_t utf16[MAX_PASSWORD_LEN * 2];
+    size_t utf16_len = 0;
+    for (size_t i = 0; password[i] && i < MAX_PASSWORD_LEN; i++) {
+        utf16[utf16_len++] = (uint8_t)password[i];
+        utf16[utf16_len++] = 0x00;
+    }
+
+    sha1_ctx_t ctx;
+    sha1_init(&ctx);
+
+    for (uint32_t i = 0; i < 524288; i++) {
+        sha1_update(&ctx, utf16, utf16_len);
+        sha1_update(&ctx, salt, 8);
+        uint8_t ctrl[3];
+        ctrl[0] = (uint8_t)(i & 0xFF);
+        ctrl[1] = (uint8_t)((i >> 8) & 0xFF);
+        ctrl[2] = (uint8_t)((i >> 16) & 0xFF);
+        sha1_update(&ctx, ctrl, 3);
+
+        if ((i & 0x3FFF) == 0x3FFF) {
+            sha1_ctx_t temp_ctx = ctx;
+            uint8_t digest[20];
+            sha1_final(&temp_ctx, digest);
+            if (i < 262144)
+                key[i >> 14] = digest[19];
+            else
+                iv[(i >> 14) - 16] = digest[19];
+        }
+    }
+    secure_memzero(utf16, sizeof(utf16));
+}
+
+static void rar5_derive_values(const char *password, const uint8_t *salt, uint32_t iterations, uint8_t key[32], uint8_t check[8]) {
+    uint8_t U[32], T[32];
+    size_t pass_len = strlen(password);
+
+    uint8_t salt_blk[16 + 4];
+    memcpy(salt_blk, salt, 16);
+    salt_blk[16] = 0; salt_blk[17] = 0; salt_blk[18] = 0; salt_blk[19] = 1;
+
+    hmac_sha256((const uint8_t *)password, pass_len, salt_blk, 20, U);
+    memcpy(T, U, 32);
+
+    for (uint32_t i = 1; i < iterations; i++) {
+        hmac_sha256((const uint8_t *)password, pass_len, U, 32, U);
+        for (int j = 0; j < 32; j++) T[j] ^= U[j];
+    }
+    if (key) memcpy(key, T, 32);
+
+    /* additionnal 16 rounds for Hash Key value (not used here) */
+    for (uint32_t i = 0; i < 16; i++) {
+        hmac_sha256((const uint8_t *)password, pass_len, U, 32, U);
+    }
+
+    /* additionnal 16 rounds for Password Check value */
+    memset(T, 0, 32);
+    for (uint32_t i = 0; i < 16; i++) {
+        hmac_sha256((const uint8_t *)password, pass_len, U, 32, U);
+        for (int j = 0; j < 32; j++) T[j] ^= U[j];
+    }
+    if (check) memcpy(check, T, 8);
+    secure_memzero(U, sizeof(U));
+    secure_memzero(T, sizeof(T));
+    secure_memzero(salt_blk, sizeof(salt_blk));
+}
+
 /* ============================================================
  * AES-256 IMPLEMENTATION (for 7Z decryption)
  * ============================================================ */
@@ -504,7 +640,7 @@ static const uint8_t aes_rcon[11] = {
 };
 
 FORCE_INLINE uint8_t aes_xtime(uint8_t x) {
-    return (x << 1) ^ ((x >> 7) * 0x1b);
+    return (uint8_t)((x << 1) ^ ((x >> 7) * 0x1b));
 }
 
 FORCE_INLINE uint8_t aes_mul(uint8_t x, uint8_t y) {
@@ -513,6 +649,36 @@ FORCE_INLINE uint8_t aes_mul(uint8_t x, uint8_t y) {
            ((y >> 2 & 1) * aes_xtime(aes_xtime(x))) ^
            ((y >> 3 & 1) * aes_xtime(aes_xtime(aes_xtime(x)))) ^
            ((y >> 4 & 1) * aes_xtime(aes_xtime(aes_xtime(aes_xtime(x)))));
+}
+
+static void aes128_key_expansion(aes_ctx_t *ctx,
+                                  const uint8_t key[16]) {
+    uint32_t *rk = ctx->round_key;
+
+    for (int i = 0; i < 4; i++) {
+        rk[i] = ((uint32_t)key[i*4]   << 24) |
+                ((uint32_t)key[i*4+1] << 16) |
+                ((uint32_t)key[i*4+2] <<  8) |
+                ((uint32_t)key[i*4+3]);
+    }
+
+    for (int i = 4; i < 4 * (10 + 1); i++) {
+        uint32_t t = rk[i - 1];
+        if (i % 4 == 0) {
+            uint8_t tmp[4];
+            tmp[0] = aes_sbox[(t >> 16) & 0xFF];
+            tmp[1] = aes_sbox[(t >>  8) & 0xFF];
+            tmp[2] = aes_sbox[(t      ) & 0xFF];
+            tmp[3] = aes_sbox[(t >> 24) & 0xFF];
+            t = ((uint32_t)tmp[0] << 24) |
+                ((uint32_t)tmp[1] << 16) |
+                ((uint32_t)tmp[2] <<  8) |
+                ((uint32_t)tmp[3]);
+            t ^= ((uint32_t)aes_rcon[i / 4]) << 24;
+        }
+        rk[i] = rk[i - 4] ^ t;
+    }
+    ctx->nr = 10;
 }
 
 static void aes256_key_expansion(aes_ctx_t *ctx,
@@ -650,9 +816,9 @@ static void aes_inv_mix_columns(uint8_t state[16]) {
     }
 }
 
-static void aes256_decrypt_block(const aes_ctx_t *ctx,
-                                  const uint8_t in[16],
-                                  uint8_t out[16]) {
+static void aes_decrypt_block(const aes_ctx_t *ctx,
+                               const uint8_t in[16],
+                               uint8_t out[16]) {
     uint8_t state[16];
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
@@ -674,17 +840,17 @@ static void aes256_decrypt_block(const aes_ctx_t *ctx,
             out[r*4 + c] = state[r + c*4];
 }
 
-static void aes256_cbc_decrypt(const aes_ctx_t *ctx,
-                                const uint8_t *iv,
-                                const uint8_t *in,
-                                uint8_t *out,
-                                size_t len) {
+static void aes_cbc_decrypt(const aes_ctx_t *ctx,
+                             const uint8_t *iv,
+                             const uint8_t *in,
+                             uint8_t *out,
+                             size_t len) {
     uint8_t prev[AES_BLOCK_SIZE];
     uint8_t block[AES_BLOCK_SIZE];
     memcpy(prev, iv, AES_BLOCK_SIZE);
 
     for (size_t i = 0; i + AES_BLOCK_SIZE <= len; i += AES_BLOCK_SIZE) {
-        aes256_decrypt_block(ctx, in + i, block);
+        aes_decrypt_block(ctx, in + i, block);
         for (int j = 0; j < AES_BLOCK_SIZE; j++)
             out[i + j] = block[j] ^ prev[j];
         memcpy(prev, in + i, AES_BLOCK_SIZE);
@@ -923,9 +1089,9 @@ int zip_parse(struct zip_ctx *ctx, const char *path) {
     }
 
     const zip_eocd_t *eocd = (const zip_eocd_t *)eocd_ptr;
-    uint32_t cd_offset     = le32((uint8_t *)&eocd->central_dir_offset);
-    uint32_t cd_size       = le32((uint8_t *)&eocd->central_dir_size);
-    uint16_t total_entries = le16((uint8_t *)&eocd->total_entries);
+    uint32_t cd_offset     = le32((const uint8_t *)&eocd->central_dir_offset);
+    uint32_t cd_size       = le32((const uint8_t *)&eocd->central_dir_size);
+    uint16_t total_entries = le16((const uint8_t *)&eocd->total_entries);
 
     log_debug("zip_parse: EOCD found, %u entries, CD at 0x%08X (size %u)",
               total_entries, cd_offset, cd_size);
@@ -946,16 +1112,16 @@ int zip_parse(struct zip_ctx *ctx, const char *path) {
 
         const zip_central_header_t *ch = (const zip_central_header_t *)cd_ptr;
 
-        uint16_t flags     = le16((uint8_t *)&ch->flags);
-        uint16_t method    = le16((uint8_t *)&ch->compression_method);
-        uint32_t crc       = le32((uint8_t *)&ch->crc32);
-        uint32_t comp_sz   = le32((uint8_t *)&ch->compressed_size);
-        uint32_t ucomp_sz  = le32((uint8_t *)&ch->uncompressed_size);
-        uint16_t fn_len    = le16((uint8_t *)&ch->filename_len);
-        uint16_t extra_len = le16((uint8_t *)&ch->extra_field_len);
-        uint16_t cm_len    = le16((uint8_t *)&ch->comment_len);
-        uint32_t lh_offset = le32((uint8_t *)&ch->local_header_offset);
-        uint16_t mod_time  = le16((uint8_t *)&ch->last_mod_time);
+        uint16_t flags     = le16((const uint8_t *)&ch->flags);
+        uint16_t method    = le16((const uint8_t *)&ch->compression_method);
+        uint32_t crc       = le32((const uint8_t *)&ch->crc32);
+        uint32_t comp_sz   = le32((const uint8_t *)&ch->compressed_size);
+        uint32_t ucomp_sz  = le32((const uint8_t *)&ch->uncompressed_size);
+        uint16_t fn_len    = le16((const uint8_t *)&ch->filename_len);
+        uint16_t extra_len = le16((const uint8_t *)&ch->extra_field_len);
+        uint16_t cm_len    = le16((const uint8_t *)&ch->comment_len);
+        uint32_t lh_offset = le32((const uint8_t *)&ch->local_header_offset);
+        uint16_t mod_time  = le16((const uint8_t *)&ch->last_mod_time);
 
         ctx->num_files++;
 
@@ -1002,8 +1168,8 @@ int zip_parse(struct zip_ctx *ctx, const char *path) {
                         const zip_local_header_t *lh =
                             (const zip_local_header_t *)lh_ptr;
 
-                        uint16_t lfn_len    = le16((uint8_t *)&lh->filename_len);
-                        uint16_t lextra_len = le16((uint8_t *)&lh->extra_field_len);
+                        uint16_t lfn_len    = le16((const uint8_t *)&lh->filename_len);
+                        uint16_t lextra_len = le16((const uint8_t *)&lh->extra_field_len);
 
                         size_t data_start = lh_offset +
                             sizeof(zip_local_header_t) +
@@ -1156,6 +1322,7 @@ static void pbkdf2_sha1(const uint8_t *password, size_t pass_len,
         memcpy(out + done, T, copy);
         done += copy;
     }
+    secure_memzero(salt_blk, sizeof(salt_blk));
 }
 
 /* ============================================================
@@ -1670,9 +1837,9 @@ int sz_parse(struct sz_ctx *ctx, const char *path) {
     const sz_signature_header_t *hdr =
         (const sz_signature_header_t *)ctx->data;
 
-    ctx->next_header_offset = le64((uint8_t *)&hdr->next_header_offset);
-    ctx->next_header_size   = le64((uint8_t *)&hdr->next_header_size);
-    ctx->next_header_crc    = le32((uint8_t *)&hdr->next_header_crc);
+    ctx->next_header_offset = le64((const uint8_t *)&hdr->next_header_offset);
+    ctx->next_header_size   = le64((const uint8_t *)&hdr->next_header_size);
+    ctx->next_header_crc    = le32((const uint8_t *)&hdr->next_header_crc);
 
     log_debug("sz_parse: ver=%u.%u, offset=0x%llX, size=%llu, crc=0x%08X",
               hdr->major_version, hdr->minor_version,
@@ -1825,6 +1992,283 @@ static void sz_derive_key(const char *password,
     }
 
     sha256_final(&sha_ctx, key);
+    secure_memzero(utf16, sizeof(utf16));
+    secure_memzero(round_data, sizeof(round_data));
+}
+
+/* ============================================================
+ * RAR PARSING AND VALIDATION
+ * ============================================================ */
+
+static int rar_read_vint(const uint8_t *p, size_t max_len, uint64_t *out) {
+    uint64_t res = 0;
+    int shift = 0;
+    for (int i = 0; i < 10 && i < (int)max_len; i++) {
+        res |= (uint64_t)(p[i] & 0x7f) << shift;
+        if (!(p[i] & 0x80)) {
+            if (out) *out = res;
+            return i + 1;
+        }
+        shift += 7;
+    }
+    return -1;
+}
+
+static bool rar_validate_cli(const char *archive_path, const char *password) {
+    if (!archive_path || !password) return false;
+    char pwarg[MAX_PASSWORD_LEN + 3];
+    snprintf(pwarg, sizeof(pwarg), "-p%s", password);
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+        execlp("unrar", "unrar", "t", "-y", pwarg, archive_path, (char *)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+int rar_parse(struct rar_ctx *ctx, const char *path) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->fd = open(path, O_RDONLY);
+    if (ctx->fd < 0) {
+        log_error("rar_parse: cannot open '%s': %s", path, strerror(errno));
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(ctx->fd, &st) != 0) {
+        log_error("rar_parse: fstat failed");
+        close(ctx->fd);
+        return -1;
+    }
+
+    ctx->data_size = (size_t)st.st_size;
+    if (ctx->data_size < 7) {
+        log_error("rar_parse: file too small");
+        close(ctx->fd);
+        return -1;
+    }
+
+    ctx->data = (const uint8_t *)mmap(NULL, ctx->data_size, PROT_READ, MAP_PRIVATE, ctx->fd, 0);
+    if (ctx->data == MAP_FAILED) {
+        log_warn("rar_parse: mmap failed, falling back to read");
+        uint8_t *buf = (uint8_t *)malloc(ctx->data_size);
+        if (!buf) {
+            log_error("rar_parse: malloc failed");
+            close(ctx->fd);
+            return -1;
+        }
+        if (read(ctx->fd, buf, ctx->data_size) != (ssize_t)ctx->data_size) {
+            log_error("rar_parse: read failed");
+            free(buf);
+            close(ctx->fd);
+            return -1;
+        }
+        ctx->data = buf;
+        ctx->mmap_used = false;
+    } else {
+        ctx->mmap_used = true;
+        madvise((void *)ctx->data, ctx->data_size, MADV_SEQUENTIAL);
+    }
+
+    /* Signature scanning (handle SFX) */
+    size_t sig_pos = 0;
+    bool found_sig = false;
+    size_t scan_limit = (ctx->data_size > 1024 * 1024) ? 1024 * 1024 : ctx->data_size - 7;
+
+    for (size_t i = 0; i < scan_limit; i++) {
+        if (ctx->data[i] == 0x52 && ctx->data[i+1] == 0x61 &&
+            ctx->data[i+2] == 0x72 && ctx->data[i+3] == 0x21) {
+            if (i + 7 <= ctx->data_size &&
+                ctx->data[i+4] == 0x1A && ctx->data[i+5] == 0x07 && ctx->data[i+6] == 0x01) {
+                ctx->version = 5;
+                sig_pos = i;
+                found_sig = true;
+                break;
+            } else if (i + 6 <= ctx->data_size &&
+                       ctx->data[i+4] == 0x1A && ctx->data[i+5] == 0x07 && ctx->data[i+6] == 0x00) {
+                ctx->version = 3;
+                sig_pos = i;
+                found_sig = true;
+                break;
+            }
+        }
+    }
+
+    if (!found_sig) {
+        log_error("rar_parse: RAR signature not found");
+        goto fail;
+    }
+
+    log_debug("rar_parse: found RARv%d signature at offset %zu", ctx->version, sig_pos);
+
+    if (ctx->version == 5) {
+        size_t pos = sig_pos + 8;
+        while (pos + 7 < ctx->data_size) {
+            uint64_t h_size, h_type, h_flags;
+            int n;
+            /* Header CRC is at pos, Header Size starts at pos+4 */
+            n = rar_read_vint(ctx->data + pos + 4, ctx->data_size - pos - 4, &h_size);
+            if (n < 0) break;
+            size_t header_payload_start = pos + 4 + (size_t)n;
+
+            n = rar_read_vint(ctx->data + header_payload_start, ctx->data_size - header_payload_start, &h_type);
+            if (n < 0) break;
+            size_t flags_pos = header_payload_start + (size_t)n;
+
+            n = rar_read_vint(ctx->data + flags_pos, ctx->data_size - flags_pos, &h_flags);
+            if (n < 0) break;
+
+            if (h_type == 4) { /* Encryption Header */
+                size_t enc_pos = flags_pos + (size_t)n;
+                uint64_t enc_ver, enc_flags;
+                n = rar_read_vint(ctx->data + enc_pos, ctx->data_size - enc_pos, &enc_ver);
+                if (n < 0) break;
+                enc_pos += (size_t)n;
+                n = rar_read_vint(ctx->data + enc_pos, ctx->data_size - enc_pos, &enc_flags);
+                if (n < 0) break;
+                enc_pos += (size_t)n;
+
+                if (enc_pos + 17 > ctx->data_size) break;
+                ctx->iterations = 1U << ctx->data[enc_pos++];
+                memcpy(ctx->salt, ctx->data + enc_pos, 16);
+                enc_pos += 16;
+                ctx->salt_len = 16;
+                if (enc_flags & 0x0001) {
+                    if (enc_pos + 12 > ctx->data_size) break;
+                    memcpy(ctx->check_value, ctx->data + enc_pos, 12);
+                    ctx->has_check_value = true;
+                }
+                ctx->is_header_encrypted = true;
+                ctx->is_encrypted = true;
+                break;
+            }
+            pos += 4 + (size_t)n + (size_t)h_size;
+        }
+    } else {
+        size_t pos = sig_pos + 7;
+        while (pos + 7 < ctx->data_size) {
+            uint16_t h_type = ctx->data[pos+2];
+            uint16_t h_flags = le16(ctx->data + pos + 3);
+            uint16_t h_size = le16(ctx->data + pos + 5);
+
+            if (pos + h_size > ctx->data_size) break;
+
+            if (h_type == 0x73) { /* Archive Header */
+                if (h_flags & 0x0080) {
+                    if (pos + h_size + 8 > ctx->data_size) break;
+                    ctx->is_header_encrypted = true;
+                    ctx->is_encrypted = true;
+                    memcpy(ctx->salt, ctx->data + pos + h_size, 8);
+                    ctx->salt_len = 8;
+                    break;
+                }
+            }
+            if (h_type == 0x74) { /* File Header */
+                if (h_flags & 0x0004) {
+                    if (pos + h_size < 8) break; /* should not happen */
+                    ctx->is_encrypted = true;
+                    memcpy(ctx->salt, ctx->data + pos + h_size - 8, 8);
+                    ctx->salt_len = 8;
+                    break;
+                }
+            }
+
+            size_t next_pos = pos + h_size;
+            if (h_type == 0x74) {
+                next_pos += (size_t)le32(ctx->data + pos + 7); /* add pack size */
+            }
+            if (next_pos <= pos) break; /* avoid infinite loop */
+            pos = next_pos;
+        }
+    }
+
+    if (!ctx->is_encrypted) goto fail;
+    ctx->parsed = true;
+    return 0;
+
+fail:
+    if (ctx->mmap_used) munmap((void *)ctx->data, ctx->data_size);
+    close(ctx->fd);
+    return -1;
+}
+
+void rar_ctx_free(struct rar_ctx *ctx) {
+    if (!ctx) return;
+    if (ctx->data) {
+        if (ctx->mmap_used)
+            munmap((void *)ctx->data, ctx->data_size);
+        else
+            free((void *)ctx->data);
+        ctx->data = NULL;
+    }
+    if (ctx->fd >= 0) {
+        close(ctx->fd);
+        ctx->fd = -1;
+    }
+    ctx->parsed = false;
+}
+
+bool rar_validate_password(const struct rar_ctx *ctx, const char *password, const char *path) {
+    if (ctx->version == 5) {
+        if (ctx->has_check_value) {
+            uint8_t derived_check[8];
+            rar5_derive_values(password, ctx->salt, ctx->iterations, NULL, derived_check);
+            if (memcmp(derived_check, ctx->check_value, 8) == 0) {
+                /* checksum check */
+                uint8_t digest[32];
+                sha256(ctx->check_value, 8, digest);
+                if (memcmp(digest, ctx->check_value + 8, 4) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    } else {
+        /* RAR3: custom derivation + structural check */
+        uint8_t key[16], iv[16];
+        rar3_derive_key(password, ctx->salt, key, iv);
+
+        /* If headers are encrypted, we can decrypt the first block after the salt
+           and check for a valid RAR3 header type. */
+        if (ctx->is_header_encrypted && ctx->data_size > 7 + 7 + 8 + 16) {
+            /* Sig(7) + MainHdr(7) + Salt(8) = 22. Next is encrypted. */
+            size_t enc_start = 0;
+            /* Re-scan for the salt position to be sure */
+            for (size_t i = 0; i < ctx->data_size - 15; i++) {
+                if (memcmp(ctx->data + i, "Rar!\x1a\x07\x00", 7) == 0) {
+                    uint16_t h_size = le16(ctx->data + i + 5);
+                    enc_start = i + h_size + 8;
+                    break;
+                }
+            }
+
+            if (enc_start > 0 && enc_start + 16 <= ctx->data_size) {
+                aes_ctx_t aes;
+                aes128_key_expansion(&aes, key);
+                uint8_t block[16], dec[16];
+                memcpy(block, ctx->data + enc_start, 16);
+                aes_cbc_decrypt(&aes, iv, block, dec, 16);
+
+                /* First byte of decrypted block should be part of a header CRC or type.
+                   In RAR3, header type is at offset 2. */
+                uint8_t type = dec[2];
+                bool type_valid = (type == 0x73 || type == 0x74 || type == 0x75 ||
+                                   type == 0x76 || type == 0x77 || type == 0x78 || type == 0x7a);
+                if (!type_valid) return false;
+            }
+        }
+    }
+    /* Definitive CLI check for RAR3 or RAR5 without check data */
+    return rar_validate_cli(path, password);
 }
 
 /* ============================================================
@@ -1887,10 +2331,10 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
     memcpy(iv, ctx->aes_iv, AES_BLOCK_SIZE);
 
     uint8_t dec_block[AES_BLOCK_SIZE];
-    aes256_cbc_decrypt(&aes, iv,
-                        ctx->enc_header_data,
-                        dec_block,
-                        AES_BLOCK_SIZE);
+    aes_cbc_decrypt(&aes, iv,
+                     ctx->enc_header_data,
+                     dec_block,
+                     AES_BLOCK_SIZE);
 
     /*
      * ── 7Z CRC32 validation of decrypted header ──
@@ -1921,10 +2365,10 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
                     if (aes_len > hdr_sz)
                         memset(enc_padded + hdr_sz, 0, aes_len - hdr_sz);
 
-                    aes256_cbc_decrypt(&aes, iv,
-                                        enc_padded,
-                                        dec_hdr,
-                                        aes_len);
+                    aes_cbc_decrypt(&aes, iv,
+                                     enc_padded,
+                                     dec_hdr,
+                                     aes_len);
                     free(enc_padded);
 
                     uint32_t computed_crc = crc32_full(dec_hdr, hdr_sz);
@@ -1988,6 +2432,8 @@ int archive_open(archive_ctx_t *ctx, const char *path,
             return zip_parse(&ctx->zip, path);
         case ARCHIVE_7Z:
             return sz_parse(&ctx->sz, path);
+        case ARCHIVE_RAR:
+            return rar_parse(&ctx->rar, path);
         default:
             log_error("archive_open: unsupported type %d", type);
             return -1;
@@ -1999,6 +2445,7 @@ void archive_ctx_free(archive_ctx_t *ctx) {
     switch (ctx->type) {
         case ARCHIVE_ZIP: zip_ctx_free(&ctx->zip); break;
         case ARCHIVE_7Z:  sz_ctx_free(&ctx->sz);   break;
+        case ARCHIVE_RAR: rar_ctx_free(&ctx->rar); break;
         default: break;
     }
 }
@@ -2012,6 +2459,8 @@ bool archive_validate_password(const archive_ctx_t *ctx,
             return zip_validate_password(&ctx->zip, password);
         case ARCHIVE_7Z:
             return sz_validate_password(&ctx->sz, password, ctx->path);
+        case ARCHIVE_RAR:
+            return rar_validate_password(&ctx->rar, password, ctx->path);
         default:
             return false;
     }
@@ -2027,6 +2476,9 @@ int archive_ctx_clone(archive_ctx_t *dst, const archive_ctx_t *src) {
     } else if (src->type == ARCHIVE_7Z) {
         dst->sz.mmap_used = false;
         dst->sz.fd        = -1;
+    } else if (src->type == ARCHIVE_RAR) {
+        dst->rar.mmap_used = false;
+        dst->rar.fd        = -1;
     }
     return 0;
 }
@@ -2075,6 +2527,16 @@ void archive_print_info(const archive_ctx_t *ctx, bool no_color) {
             fprintf(stderr,"  %sSalt Len:%s %s%d%s\n",c_l,c_r,c_v,s->aes_salt_len,c_r);
             break;
         }
+        case ARCHIVE_RAR: {
+            const struct rar_ctx *r = &ctx->rar;
+            fprintf(stderr,"  %sType:%s     %sRAR (v%d)%s\n", c_l,c_r,c_v,r->version,c_r);
+            fprintf(stderr,"  %sEncrypted:%s%sYes%s\n",        c_l,c_r,c_v,c_r);
+            if (r->version == 5) {
+                fprintf(stderr,"  %sKDF Iters:%s%s%u%s\n",    c_l,c_r,c_v,r->iterations,c_r);
+            }
+            fprintf(stderr,"  %sSalt Len:%s %s%d%s\n",        c_l,c_r,c_v,r->salt_len,c_r);
+            break;
+        }
         default:
             fprintf(stderr,"  Type: Unknown\n");
             break;
@@ -2098,8 +2560,10 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
 
     struct zip_ctx zip_dummy;
     struct sz_ctx  sz_dummy;
+    struct rar_ctx rar_dummy;
     memset(&zip_dummy, 0, sizeof(zip_dummy));
     memset(&sz_dummy,  0, sizeof(sz_dummy));
+    memset(&rar_dummy, 0, sizeof(rar_dummy));
 
     zip_dummy.parsed             = true;
     zip_dummy.has_encrypted_file = true;
@@ -2119,6 +2583,14 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
     for (int i = 0; i < 32; i++)
         sz_dummy.enc_header_data[i] = (uint8_t)(i * 37);
     sz_dummy.enc_header_size = 32;
+
+    rar_dummy.parsed             = true;
+    rar_dummy.is_encrypted       = true;
+    rar_dummy.iterations         = 1024;
+    rar_dummy.salt_len           = 16;
+    memset(rar_dummy.salt, 0xAB, 16);
+    rar_dummy.has_check_value    = true;
+    memset(rar_dummy.check_value, 0xCD, 12);
 
     const char *test_pw = "benchmark_password_test";
     uint64_t    count   = 0;
@@ -2145,6 +2617,18 @@ archive_bench_t archive_benchmark(archive_type_t type, int duration_ms) {
         while (true) {
             for (int i = 0; i < 10; i++) {
                 sz_validate_password(&sz_dummy, test_pw, NULL);
+                count++;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &ts_end);
+            end = (uint64_t)ts_end.tv_sec * 1000000000ULL +
+                  (uint64_t)ts_end.tv_nsec;
+            if (end - start >= duration_ns) break;
+        }
+    } else if (type == ARCHIVE_RAR) {
+        while (true) {
+            rar_dummy.version = 5; /* Fast RAR5 path */
+            for (int i = 0; i < 10; i++) {
+                rar_validate_password(&rar_dummy, test_pw, NULL);
                 count++;
             }
             clock_gettime(CLOCK_MONOTONIC, &ts_end);

@@ -233,6 +233,7 @@ typedef enum {
     ARCHIVE_UNKNOWN = 0,
     ARCHIVE_ZIP     = 1,
     ARCHIVE_7Z      = 2,
+    ARCHIVE_RAR     = 3,
     ARCHIVE_MAX
 } archive_type_t;
 
@@ -1347,7 +1348,7 @@ FORCE_INLINE size_t safe_memcpy(void *dst, size_t dst_size,
 }
 
 /* Secure memset (compiler won't optimize away) */
-FORCE_INLINE void secure_memzero(void *ptr, size_t len) {
+void secure_memzero(void *ptr, size_t len) {
     volatile uint8_t *p = (volatile uint8_t *)ptr;
     while (len--) *p++ = 0;
 }
@@ -2018,10 +2019,18 @@ archive_type_t detect_archive_type(const char *path) {
         return ARCHIVE_7Z;
     }
 
+    /* RAR: Rar!\x1A\x07\x00 (v3/4) or Rar!\x1A\x07\x01\x00 (v5) */
+    if (magic[0] == 0x52 && magic[1] == 0x61 &&
+        magic[2] == 0x72 && magic[3] == 0x21 &&
+        magic[4] == 0x1A && magic[5] == 0x07) {
+        return ARCHIVE_RAR;
+    }
+
     /* Try extension fallback */
     const char *ext = file_extension(path);
     if (str_icmp(ext, "zip") == 0) return ARCHIVE_ZIP;
     if (str_icmp(ext, "7z")  == 0) return ARCHIVE_7Z;
+    if (str_icmp(ext, "rar") == 0) return ARCHIVE_RAR;
 
     return ARCHIVE_UNKNOWN;
 }
