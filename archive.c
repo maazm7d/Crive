@@ -2344,9 +2344,9 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
     uint8_t first = dec_block[0];
     bool maybe_ok = false;
     if (ctx->is_header_encrypted) {
-        /* 7z headers are almost always LZMA compressed.
-         * The standard LZMA properties byte is 0x5D. */
-        maybe_ok = (first == 0x5D);
+        /* If the header is encrypted, we currently fallback to the CLI.
+           Heuristics on compressed streams are unreliable. */
+        maybe_ok = true;
     } else {
         maybe_ok = (first == SZ_ID_HEADER          ||
                     first == SZ_ID_ENCODED_HEADER   ||

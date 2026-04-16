@@ -213,6 +213,49 @@ jobs:
           echo "===== VALIDATION ====="
           grep -q "password" rar.log
 
+      - name: RAR3 Test (Ultra Verbose)
+        run: |
+          set -x
+          echo "===== CREATE RAR3 ====="
+          # Create a RAR3 archive with encrypted headers
+          echo "data" > file.txt
+          # Using 7z to create a RAR3 archive is tricky, we use a pre-existing one from tests if possible
+          # or we rely on the fact that our RAR3 parsing is verified by the structural check.
+          # Here we use the C generator to create a minimal structural RAR3 archive
+          cat <<EOF > gen_rar3.c
+          #include <stdio.h>
+          #include <stdint.h>
+          #include <string.h>
+          int main() {
+              FILE *f = fopen("test_rar3.rar", "wb");
+              // Signature
+              fwrite("Rar!\x1a\x07\x00", 1, 7, f);
+              // Main Archive Header (type 0x73)
+              uint8_t mhdr[] = {
+                  0x00, 0x00, // head_crc (dummy)
+                  0x73,       // head_type
+                  0x80, 0x00, // head_flags (0x0080 = encrypted headers)
+                  0x0d, 0x00, // head_size (7 + 8 = 15 -> 0x000d?) no, 13
+              };
+              fwrite(mhdr, 1, sizeof(mhdr), f);
+              // Salt (8 bytes)
+              uint8_t salt[8] = {1,2,3,4,5,6,7,8};
+              fwrite(salt, 1, 8, f);
+              // Encrypted block start... we just need enough to trigger the structural check
+              uint8_t enc[16] = {0};
+              fwrite(enc, 1, 16, f);
+              fclose(f);
+              return 0;
+          }
+          EOF
+          gcc gen_rar3.c -o gen_rar3
+          ./gen_rar3
+
+          echo "===== RUN CRIVE (Detection Test) ====="
+          ./build/bin/crive test_rar3.rar --benchmark --no-color --verbose > rar3.log 2>&1 || true
+          cat rar3.log
+          grep -q "RAR (v3)" rar3.log
+
       - name: Benchmark (Verbose)
         run: |
           set -x
