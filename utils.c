@@ -1968,11 +1968,13 @@ archive_type_t detect_archive_type(const char *path) {
         return ARCHIVE_7Z;
     }
 
-    /* RAR: Rar!\x1A\x07\x00 (v3/4) or Rar!\x1A\x07\x01\x00 (v5) */
+        /* RAR: Rar!\x1A\x07\x00 (v3/4) or Rar!\x1A\x07\x01\x00 (v5) */
     if (magic[0] == 0x52 && magic[1] == 0x61 &&
         magic[2] == 0x72 && magic[3] == 0x21 &&
         magic[4] == 0x1A && magic[5] == 0x07) {
-        return ARCHIVE_RAR;
+        if (magic[6] == 0x00 || magic[6] == 0x01) {
+            return ARCHIVE_RAR;
+        }
     }
 
     /* Try extension fallback */

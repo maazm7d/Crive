@@ -767,11 +767,7 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
  * ============================================================ */
 
 static int validate_config(config_t *cfg) {
-
-    /* Benchmark needs no archive */
-    if (cfg->attack_mode == ATTACK_BENCHMARK) {
-        return 0;
-    }
+    if (cfg->attack_mode == ATTACK_BENCHMARK && cfg->archive_path[0] == '\0') return 0;
 
     /* Archive required for all other modes */
     if (cfg->archive_path[0] == '\0') {

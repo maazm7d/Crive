@@ -2180,6 +2180,7 @@ int rar_parse(struct rar_ctx *ctx, const char *path) {
             }
 
             size_t next_pos = pos + h_size;
+            if (h_type == 0x73 && (h_flags & 0x0080)) next_pos += 8;
             if (h_type == 0x74) {
                 next_pos += (size_t)le32(ctx->data + pos + 7); /* add pack size */
             }
