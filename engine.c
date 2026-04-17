@@ -29,14 +29,6 @@
  * FORWARD DECLARATIONS FROM utils.c
  * ============================================================ */
 
-typedef enum {
-    LOG_DEBUG   = 0,
-    LOG_INFO    = 1,
-    LOG_WARNING = 2,
-    LOG_ERROR   = 3,
-    LOG_SILENT  = 4,
-} log_level_t;
-
 void log_message(log_level_t level, const char *fmt, ...);
 #define log_debug(fmt, ...)  log_message(LOG_DEBUG,   fmt, ##__VA_ARGS__)
 #define log_info(fmt, ...)   log_message(LOG_INFO,    fmt, ##__VA_ARGS__)
@@ -62,119 +54,6 @@ void log_message(log_level_t level, const char *fmt, ...);
 #define PROGRESS_UPDATE_MS   250
 #define KB                   (1024ULL)
 #define MB                   (1024ULL * KB)
-
-/* ============================================================
- * STRUCT FORWARD DECLARATIONS
- * ============================================================ */
-
-typedef enum {
-    ATTACK_NONE         = 0,
-    ATTACK_DICTIONARY   = 1,
-    ATTACK_BRUTEFORCE   = 2,
-    ATTACK_MASK         = 3,
-    ATTACK_HYBRID       = 4,
-    ATTACK_RULE         = 5,
-    ATTACK_BENCHMARK    = 6,
-    ATTACK_MAX
-} attack_mode_t;
-
-typedef struct {
-    char    chars[MAX_CHARSET_LEN];
-    int     len;
-    bool    use_lower;
-    bool    use_upper;
-    bool    use_digits;
-    bool    use_special;
-    bool    use_custom;
-    char    custom[MAX_CHARSET_LEN];
-} charset_spec_t;
-
-typedef struct {
-    char    charset[MAX_CHARSET_LEN];
-    int     charset_len;
-} mask_position_t;
-
-typedef struct {
-    mask_position_t positions[MAX_MASK_POSITIONS];
-    int             num_positions;
-    char            raw_mask[MAX_MASK_LEN];
-} mask_spec_t;
-
-typedef struct {
-    bool        append_digits;
-    bool        append_special;
-    bool        prepend_digits;
-    bool        prepend_special;
-    int         suffix_min_len;
-    int         suffix_max_len;
-    int         prefix_min_len;
-    int         prefix_max_len;
-    char        suffix_charset[MAX_CHARSET_LEN];
-    char        prefix_charset[MAX_CHARSET_LEN];
-} hybrid_config_t;
-
-typedef enum {
-    RULE_APPEND_DIGIT   = 0,
-    RULE_PREPEND_DIGIT  = 1,
-    RULE_UPPERCASE_ALL  = 2,
-    RULE_LOWERCASE_ALL  = 3,
-    RULE_CAPITALIZE     = 4,
-    RULE_REVERSE        = 5,
-    RULE_DUPLICATE      = 6,
-    RULE_LEET_SPEAK     = 7,
-    RULE_APPEND_YEAR    = 8,
-    RULE_APPEND_SPECIAL = 9,
-    RULE_TOGGLE_CASE    = 10,
-    RULE_ROTATE_LEFT    = 11,
-    RULE_ROTATE_RIGHT   = 12,
-    RULE_REFLECT        = 13,
-    RULE_STRIP_VOWELS   = 14,
-    RULE_MAX
-} rule_type_t;
-
-typedef struct {
-    rule_type_t type;
-    char        param[64];
-    int         param_int;
-} rule_t;
-
-/* ============================================================
- * CONFIG STRUCT
- * ============================================================ */
-
-typedef struct {
-    char            archive_path[MAX_PATH_LEN];
-    archive_type_t  archive_type;
-    attack_mode_t   attack_mode;
-    char            wordlist_path[MAX_PATH_LEN];
-    size_t          dict_buffer_size;
-    int             min_length;
-    int             max_length;
-    charset_spec_t  charset;
-    mask_spec_t     mask;
-    hybrid_config_t hybrid;
-    char            rules_path[MAX_PATH_LEN];
-    rule_t          rules[MAX_RULES];
-    int             num_rules;
-    int             num_threads;
-    size_t          batch_size;
-    char            output_path[MAX_PATH_LEN];
-    char            log_path[MAX_PATH_LEN];
-    bool            verbose;
-    bool            quiet;
-    log_level_t     log_level;
-    bool            no_color;
-    bool            show_progress;
-    bool            resume;
-    char            resume_path[MAX_PATH_LEN];
-    bool            save_resume;
-    int             benchmark_duration;
-    uint64_t        limit;
-    uint64_t        skip;
-    int             progress_interval_ms;
-    bool            force_archive_type;
-    bool            interactive;
-} config_t;
 
 /* ============================================================
  * FORWARD DECLARATIONS FROM attacks.c
@@ -262,23 +141,6 @@ extern void   speed_tracker_update     (speed_tracker_t *st,
                                          uint64_t total_attempts);
 extern double speed_tracker_moving_avg (const speed_tracker_t *st);
 extern uint64_t speed_tracker_current  (const speed_tracker_t *st);
-
-/* Resume */
-typedef struct {
-    uint32_t        magic;
-    uint32_t        version;
-    attack_mode_t   attack_mode;
-    archive_type_t  archive_type;
-    char            archive_path[MAX_PATH_LEN];
-    char            wordlist_path[MAX_PATH_LEN];
-    uint64_t        total_attempts;
-    uint64_t        wordlist_offset;
-    uint64_t        bruteforce_index;
-    int             current_length;
-    char            brute_counter[MAX_PASSWORD_LEN];
-    time_t          saved_at;
-    uint32_t        checksum;
-} resume_state_t;
 
 extern int resume_save(const char *path, const resume_state_t *rs);
 extern int resume_load(const char *path, resume_state_t *rs);
@@ -911,9 +773,16 @@ static void *bench_worker_fn(void *arg) {
                     k2 = bench_hash((char[]){(char)(k1>>24),0}, k2);
                 }
                 result ^= k0 ^ k1 ^ k2;
+            } else if (ba->archive_type == ARCHIVE_RAR) {
+                /* RAR benchmark uses heavy KDF simulation */
+                for (int j = 0; j < 1000; j++) {
+                    result ^= bench_hash(pw, result);
+                }
             } else {
-                /* Simulate SHA256 iteration (more expensive) */
-                result ^= bench_hash(pw, result);
+                /* 7z benchmark (medium KDF) */
+                for (int j = 0; j < 100; j++) {
+                    result ^= bench_hash(pw, result);
+                }
             }
 
             count++;
@@ -946,13 +815,6 @@ static void *bench_worker_fn(void *arg) {
  * Sets up thread pool, launches workers, monitors progress.
  * Returns attack_result_t.
  */
-typedef enum {
-    ATTACK_RESULT_NOT_FOUND = 0,
-    ATTACK_RESULT_FOUND     = 1,
-    ATTACK_RESULT_EXHAUSTED = 2,
-    ATTACK_RESULT_ERROR     = 3,
-    ATTACK_RESULT_ABORTED   = 4,
-} attack_result_t;
 
 attack_result_t engine_run(const config_t *cfg,
                             archive_ctx_t *master_archive,
@@ -1206,6 +1068,7 @@ typedef struct {
     uint64_t    total_hashes;
     double      duration_sec;
     int         num_threads;
+    archive_type_t arch_type;
 } benchmark_result_t;
 
 benchmark_result_t engine_benchmark(const config_t *cfg,
@@ -1215,7 +1078,7 @@ benchmark_result_t engine_benchmark(const config_t *cfg,
     res.num_threads = cfg->num_threads;
 
     log_info("Benchmark: type=%s threads=%d duration=%dms",
-             (arch_type == ARCHIVE_ZIP) ? "ZIP" : "7Z",
+             (arch_type == ARCHIVE_ZIP) ? "ZIP" : (arch_type == ARCHIVE_7Z ? "7Z" : "RAR"),
              cfg->num_threads, duration_ms);
 
     engine_state_t eng;
@@ -1296,6 +1159,7 @@ benchmark_result_t engine_benchmark(const config_t *cfg,
     if (res.peak_speed < res.total_speed) {
         res.peak_speed = res.total_speed;
     }
+    res.arch_type = arch_type;
 
     free(workers);
     engine_state_cleanup_local(&eng);

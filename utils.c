@@ -29,6 +29,8 @@
 #include <locale.h>
 #include <stddef.h>
 
+#include "archive.h"
+
 /* ============================================================
  * VERSION AND BUILD INFO
  * ============================================================ */
@@ -204,17 +206,6 @@
  * ATTACK MODE ENUM
  * ============================================================ */
 
-typedef enum {
-    ATTACK_NONE         = 0,
-    ATTACK_DICTIONARY   = 1,
-    ATTACK_BRUTEFORCE   = 2,
-    ATTACK_MASK         = 3,
-    ATTACK_HYBRID       = 4,
-    ATTACK_RULE         = 5,
-    ATTACK_BENCHMARK    = 6,
-    ATTACK_MAX
-} attack_mode_t;
-
 static const char *attack_mode_names[] = {
     [ATTACK_NONE]       = "None",
     [ATTACK_DICTIONARY] = "Dictionary",
@@ -229,102 +220,16 @@ static const char *attack_mode_names[] = {
  * ARCHIVE TYPE ENUM
  * ============================================================ */
 
-typedef enum {
-    ARCHIVE_UNKNOWN = 0,
-    ARCHIVE_ZIP     = 1,
-    ARCHIVE_7Z      = 2,
-    ARCHIVE_MAX
-} archive_type_t;
-
 static const char *archive_type_names[] = {
     [ARCHIVE_UNKNOWN] = "Unknown",
     [ARCHIVE_ZIP]     = "ZIP",
     [ARCHIVE_7Z]      = "7-Zip",
+    [ARCHIVE_RAR]     = "RAR",
 };
 
 /* ============================================================
- * LOG LEVEL ENUM
+ * RULE TYPE NAMES
  * ============================================================ */
-
-typedef enum {
-    LOG_DEBUG   = 0,
-    LOG_INFO    = 1,
-    LOG_WARNING = 2,
-    LOG_ERROR   = 3,
-    LOG_SILENT  = 4,
-} log_level_t;
-
-/* ============================================================
- * CHARSET SPEC STRUCT
- * ============================================================ */
-
-typedef struct {
-    char    chars[MAX_CHARSET_LEN];
-    int     len;
-    bool    use_lower;
-    bool    use_upper;
-    bool    use_digits;
-    bool    use_special;
-    bool    use_custom;
-    char    custom[MAX_CHARSET_LEN];
-} charset_spec_t;
-
-/* ============================================================
- * MASK POSITION STRUCT
- * ============================================================ */
-
-#define MAX_MASK_POSITIONS      32
-
-typedef struct {
-    char    charset[MAX_CHARSET_LEN];
-    int     charset_len;
-} mask_position_t;
-
-typedef struct {
-    mask_position_t positions[MAX_MASK_POSITIONS];
-    int             num_positions;
-    char            raw_mask[MAX_MASK_LEN];
-} mask_spec_t;
-
-/* ============================================================
- * HYBRID CONFIG STRUCT
- * ============================================================ */
-
-typedef struct {
-    bool        append_digits;
-    bool        append_special;
-    bool        prepend_digits;
-    bool        prepend_special;
-    int         suffix_min_len;
-    int         suffix_max_len;
-    int         prefix_min_len;
-    int         prefix_max_len;
-    char        suffix_charset[MAX_CHARSET_LEN];
-    char        prefix_charset[MAX_CHARSET_LEN];
-} hybrid_config_t;
-
-/* ============================================================
- * RULE STRUCT
- * ============================================================ */
-
-typedef enum {
-    RULE_APPEND_DIGIT       = 0,
-    RULE_PREPEND_DIGIT      = 1,
-    RULE_UPPERCASE_ALL      = 2,
-    RULE_LOWERCASE_ALL      = 3,
-    RULE_CAPITALIZE         = 4,
-    RULE_REVERSE            = 5,
-    RULE_DUPLICATE          = 6,
-    RULE_LEET_SPEAK         = 7,
-    RULE_APPEND_YEAR        = 8,
-    RULE_APPEND_SPECIAL     = 9,
-    RULE_TOGGLE_CASE        = 10,
-    RULE_ROTATE_LEFT        = 11,
-    RULE_ROTATE_RIGHT       = 12,
-    RULE_REFLECT            = 13,
-    RULE_STRIP_VOWELS       = 14,
-    RULE_MAX
-} rule_type_t;
 
 static const char *rule_type_names[] __attribute__((unused)) = {
     [RULE_APPEND_DIGIT]     = "append_digit",
@@ -343,12 +248,6 @@ static const char *rule_type_names[] __attribute__((unused)) = {
     [RULE_REFLECT]          = "reflect",
     [RULE_STRIP_VOWELS]     = "strip_vowels",
 };
-
-typedef struct {
-    rule_type_t type;
-    char        param[64];
-    int         param_int;
-} rule_t;
 
 /* ============================================================
  * THREAD STATUS STRUCT
@@ -376,92 +275,6 @@ typedef struct {
     uint64_t    last_attempts;
     uint64_t    last_time_ns;
 } speed_tracker_t;
-
-/* ============================================================
- * RESUME STATE STRUCT
- * ============================================================ */
-
-typedef struct {
-    uint32_t    magic;
-    uint32_t    version;
-    attack_mode_t attack_mode;
-    archive_type_t archive_type;
-    char        archive_path[MAX_PATH_LEN];
-    char        wordlist_path[MAX_PATH_LEN];
-    uint64_t    total_attempts;
-    uint64_t    wordlist_offset;
-    uint64_t    bruteforce_index;
-    int         current_length;
-    char        brute_counter[MAX_PASSWORD_LEN];
-    time_t      saved_at;
-    uint32_t    checksum;
-} resume_state_t;
-
-/* ============================================================
- * MAIN CONFIG STRUCT
- * ============================================================ */
-
-typedef struct {
-    /* Target */
-    char            archive_path[MAX_PATH_LEN];
-    archive_type_t  archive_type;
-
-    /* Attack mode */
-    attack_mode_t   attack_mode;
-
-    /* Dictionary options */
-    char            wordlist_path[MAX_PATH_LEN];
-    size_t          dict_buffer_size;
-
-    /* Brute-force options */
-    int             min_length;
-    int             max_length;
-    charset_spec_t  charset;
-
-    /* Mask options */
-    mask_spec_t     mask;
-
-    /* Hybrid options */
-    hybrid_config_t hybrid;
-
-    /* Rule options */
-    char            rules_path[MAX_PATH_LEN];
-    rule_t          rules[MAX_RULES];
-    int             num_rules;
-
-    /* Threading */
-    int             num_threads;
-    size_t          batch_size;
-
-    /* Output */
-    char            output_path[MAX_PATH_LEN];
-    char            log_path[MAX_PATH_LEN];
-    bool            verbose;
-    bool            quiet;
-    log_level_t     log_level;
-    bool            no_color;
-    bool            show_progress;
-
-    /* Resume */
-    bool            resume;
-    char            resume_path[MAX_PATH_LEN];
-    bool            save_resume;
-
-    /* Benchmark */
-    int             benchmark_duration;
-
-    /* Limits */
-    uint64_t        limit;
-    uint64_t        skip;
-
-    /* Performance */
-    int             progress_interval_ms;
-
-    /* Internal state flags */
-    bool            force_archive_type;
-    bool            interactive;
-
-} config_t;
 
 /* ============================================================
  * SHARED ENGINE STATE STRUCT
@@ -1346,11 +1159,6 @@ FORCE_INLINE size_t safe_memcpy(void *dst, size_t dst_size,
     return copy_len;
 }
 
-/* Secure memset (compiler won't optimize away) */
-FORCE_INLINE void secure_memzero(void *ptr, size_t len) {
-    volatile uint8_t *p = (volatile uint8_t *)ptr;
-    while (len--) *p++ = 0;
-}
 
 /* ============================================================
  * STRING UTILITIES
@@ -2018,10 +1826,20 @@ archive_type_t detect_archive_type(const char *path) {
         return ARCHIVE_7Z;
     }
 
+        /* RAR: Rar!\x1A\x07\x00 (v3/4) or Rar!\x1A\x07\x01\x00 (v5) */
+    if (magic[0] == 0x52 && magic[1] == 0x61 &&
+        magic[2] == 0x72 && magic[3] == 0x21 &&
+        magic[4] == 0x1A && magic[5] == 0x07) {
+        if (magic[6] == 0x00 || magic[6] == 0x01) {
+            return ARCHIVE_RAR;
+        }
+    }
+
     /* Try extension fallback */
     const char *ext = file_extension(path);
     if (str_icmp(ext, "zip") == 0) return ARCHIVE_ZIP;
     if (str_icmp(ext, "7z")  == 0) return ARCHIVE_7Z;
+    if (str_icmp(ext, "rar") == 0) return ARCHIVE_RAR;
 
     return ARCHIVE_UNKNOWN;
 }

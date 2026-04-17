@@ -7,6 +7,9 @@
 
 #define MAX_PATH_LEN 4096
 #define MAX_PASSWORD_LEN 128
+#define MAX_CHARSET_LEN 512
+#define MAX_MASK_LEN 256
+#define MAX_THREADS 256
 
 /* -------------------------------------------------------------------------
  * Common archive type enumeration
@@ -15,8 +18,153 @@ typedef enum {
     ARCHIVE_UNKNOWN = 0,
     ARCHIVE_ZIP     = 1,
     ARCHIVE_7Z      = 2,
+    ARCHIVE_RAR     = 3,
     ARCHIVE_MAX
 } archive_type_t;
+
+typedef enum {
+    ATTACK_NONE         = 0,
+    ATTACK_DICTIONARY   = 1,
+    ATTACK_BRUTEFORCE   = 2,
+    ATTACK_MASK         = 3,
+    ATTACK_HYBRID       = 4,
+    ATTACK_RULE         = 5,
+    ATTACK_BENCHMARK    = 6,
+    ATTACK_MAX
+} attack_mode_t;
+
+typedef enum {
+    LOG_DEBUG   = 0,
+    LOG_INFO    = 1,
+    LOG_WARNING = 2,
+    LOG_ERROR   = 3,
+    LOG_SILENT  = 4,
+} log_level_t;
+
+typedef enum {
+    ATTACK_RESULT_NOT_FOUND = 0,
+    ATTACK_RESULT_FOUND     = 1,
+    ATTACK_RESULT_EXHAUSTED = 2,
+    ATTACK_RESULT_ERROR     = 3,
+    ATTACK_RESULT_ABORTED   = 4,
+} attack_result_t;
+
+typedef enum {
+    RULE_APPEND_DIGIT       = 0,
+    RULE_PREPEND_DIGIT      = 1,
+    RULE_UPPERCASE_ALL      = 2,
+    RULE_LOWERCASE_ALL      = 3,
+    RULE_CAPITALIZE         = 4,
+    RULE_REVERSE            = 5,
+    RULE_DUPLICATE          = 6,
+    RULE_LEET_SPEAK         = 7,
+    RULE_APPEND_YEAR        = 8,
+    RULE_APPEND_SPECIAL     = 9,
+    RULE_TOGGLE_CASE        = 10,
+    RULE_ROTATE_LEFT        = 11,
+    RULE_ROTATE_RIGHT       = 12,
+    RULE_REFLECT            = 13,
+    RULE_STRIP_VOWELS       = 14,
+    RULE_MAX
+} rule_type_t;
+
+typedef struct {
+    char    chars[MAX_CHARSET_LEN];
+    int     len;
+    bool    use_lower;
+    bool    use_upper;
+    bool    use_digits;
+    bool    use_special;
+    bool    use_custom;
+    char    custom[MAX_CHARSET_LEN];
+} charset_spec_t;
+
+typedef struct {
+    char    charset[MAX_CHARSET_LEN];
+    int     charset_len;
+} mask_position_t;
+
+#define MAX_MASK_POSITIONS 32
+
+typedef struct {
+    mask_position_t positions[MAX_MASK_POSITIONS];
+    int             num_positions;
+    char            raw_mask[MAX_MASK_LEN];
+} mask_spec_t;
+
+typedef struct {
+    bool        append_digits;
+    bool        append_special;
+    bool        prepend_digits;
+    bool        prepend_special;
+    int         suffix_min_len;
+    int         suffix_max_len;
+    int         prefix_min_len;
+    int         prefix_max_len;
+    char        suffix_charset[MAX_CHARSET_LEN];
+    char        prefix_charset[MAX_CHARSET_LEN];
+} hybrid_config_t;
+
+typedef struct {
+    rule_type_t type;
+    char        param[64];
+    int         param_int;
+} rule_t;
+
+#define MAX_RULES 4096
+
+typedef struct {
+    char            archive_path[MAX_PATH_LEN];
+    archive_type_t  archive_type;
+    attack_mode_t   attack_mode;
+    char            wordlist_path[MAX_PATH_LEN];
+    size_t          dict_buffer_size;
+    int             min_length;
+    int             max_length;
+    charset_spec_t  charset;
+    mask_spec_t     mask;
+    hybrid_config_t hybrid;
+    char            rules_path[MAX_PATH_LEN];
+    rule_t          rules[MAX_RULES];
+    int             num_rules;
+    int             num_threads;
+    size_t          batch_size;
+    char            output_path[MAX_PATH_LEN];
+    char            log_path[MAX_PATH_LEN];
+    bool            verbose;
+    bool            quiet;
+    log_level_t     log_level;
+    bool            no_color;
+    bool            show_progress;
+    bool            resume;
+    char            resume_path[MAX_PATH_LEN];
+    bool            save_resume;
+    int             benchmark_duration;
+    uint64_t        limit;
+    uint64_t        skip;
+    int             progress_interval_ms;
+    bool            force_archive_type;
+    bool            interactive;
+    bool            pin_threads;
+    bool            adaptive_batch;
+    bool            show_thread_stats;
+} config_t;
+
+typedef struct {
+    uint32_t        magic;
+    uint32_t        version;
+    attack_mode_t   attack_mode;
+    archive_type_t  archive_type;
+    char            archive_path[MAX_PATH_LEN];
+    char            wordlist_path[MAX_PATH_LEN];
+    uint64_t        total_attempts;
+    uint64_t        wordlist_offset;
+    uint64_t        bruteforce_index;
+    int             current_length;
+    char            brute_counter[MAX_PASSWORD_LEN];
+    time_t          saved_at;
+    uint32_t        checksum;
+} resume_state_t;
 
 /* -------------------------------------------------------------------------
  * ZIP context structure – full definition
@@ -25,6 +173,7 @@ typedef struct zip_ctx {
     const uint8_t   *data;
     size_t           data_size;
     bool             mmap_used;
+    bool             is_clone;
     int              fd;
 
     char             archive_path[MAX_PATH_LEN];   /* archive path for CLI verification */
@@ -115,6 +264,7 @@ typedef struct sz_ctx {
     const uint8_t   *data;
     size_t           data_size;
     bool             mmap_used;
+    bool             is_clone;
     int              fd;
 
     bool             parsed;
@@ -135,6 +285,34 @@ typedef struct sz_ctx {
 } sz_ctx_t;
 
 /* -------------------------------------------------------------------------
+ * RAR context structure
+ * ------------------------------------------------------------------------- */
+typedef struct rar_ctx {
+    const uint8_t   *data;
+    size_t           data_size;
+    bool             mmap_used;
+    bool             is_clone;
+    int              fd;
+
+    bool             parsed;
+    int              version;               /* 3 or 5 */
+
+    bool             is_encrypted;
+    bool             is_header_encrypted;
+
+    uint8_t          salt[16];
+    int              salt_len;
+    uint32_t         iterations;
+
+    /* RAR5 specific */
+    uint8_t          check_value[12];       /* for RAR5 password validation */
+    bool             has_check_value;
+
+    /* RAR3 specific */
+    uint8_t          iv[16];
+} rar_ctx_t;
+
+/* -------------------------------------------------------------------------
  * Unified archive context (visible to engine.c and main.c)
  * ------------------------------------------------------------------------- */
 struct archive_ctx {
@@ -143,6 +321,7 @@ struct archive_ctx {
     union {
         zip_ctx_t    zip;
         sz_ctx_t     sz;
+        rar_ctx_t    rar;
     };
     uint8_t          scratch[4096];
 };
@@ -158,5 +337,12 @@ bool archive_validate_password(const archive_ctx_t *ctx, const char *password);
 int  archive_ctx_clone(archive_ctx_t *dst, const archive_ctx_t *src);
 void archive_print_info(const archive_ctx_t *ctx, bool no_color);
 archive_type_t detect_archive_type(const char *path);
+bool command_exists(const char *cmd);
+
+static inline void secure_memzero(void *ptr, size_t len) {
+    if (!ptr || len == 0) return;
+    volatile uint8_t *p = (volatile uint8_t *)ptr;
+    while (len--) *p++ = 0;
+}
 
 #endif /* ARCHIVE_H */

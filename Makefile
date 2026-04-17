@@ -500,7 +500,7 @@ bench: all
 
 # Short benchmark
 bench-quick: all
-	$(TARGET) --benchmark --benchmark-duration 3 \
+	$(TARGET) --benchmark --benchmark 3 \
 	          --threads $(shell nproc 2>/dev/null || echo 4) \
 	          --no-color
 
@@ -546,11 +546,50 @@ $(TESTDIR)/test.7z: | $(TESTDIR)
 # Create test wordlist
 $(TESTDIR)/wordlist.txt: | $(TESTDIR)
 	@echo "Creating test wordlist..."
+	@printf '123456\ntest123\nqwerty\nletmein\ndragon\nadmin\n' > $@
+	@echo "Created: $@"
+
+$(TESTDIR)/wordlist_rar.txt: | $(TESTDIR)
+	@echo "Creating test wordlist for RAR..."
 	@printf 'password\n123456\ntest123\nqwerty\nletmein\ndragon\nadmin\n' > $@
 	@echo "Created: $@"
 
+# Create test RAR3
+$(TESTDIR)/test_rar3.rar: | $(TESTDIR)
+	@echo "Creating test RAR3 archive..."
+	@# Manual generation of a minimal RAR3 with encrypted headers for testing
+	@python3 -c "import binascii; f = open('$@', 'wb'); f.write(binascii.unhexlify('526172211a0700')); f.write(binascii.unhexlify('00007380000d0000000000000001020304050607')); f.close()"
+	@echo "Created: $@"
+
+# Create test RAR5 with password "password"
+$(TESTDIR)/test_rar5.rar: | $(TESTDIR)
+	@echo "Creating test RAR5 archive..."
+	@# Manual generation of a minimal RAR5 with encrypted headers for testing
+	@python3 -c "import binascii, hashlib; \
+	def hmac_sha256(key, data): import hmac; return hmac.new(key, data, hashlib.sha256).digest(); \
+	def rar5_check(pw, salt, iters): \
+		U = hmac_sha256(pw.encode(), salt + b'\x00\x00\x00\x01'); T = U; \
+		for i in range(1, iters): U = hmac_sha256(pw.encode(), U); T = bytes(a ^ b for a, b in zip(T, U)); \
+		for i in range(16): U = hmac_sha256(pw.encode(), U); \
+		T2 = b'\x00' * 32; \
+		for i in range(16): U = hmac_sha256(pw.encode(), U); T2 = bytes(a ^ b for a, b in zip(T2, U)); \
+		return T2[:8]; \
+	salt = b'\x00' * 16; check = rar5_check('password', salt, 1024); \
+	check_full = check + hashlib.sha256(check).digest()[:4]; \
+	f = open('$@', 'wb'); f.write(binascii.unhexlify('526172211a070100')); \
+	enc_hdr = b'\x00\x01\x0a' + salt + check_full; \
+	h_size = len(enc_hdr); \
+	f.write(binascii.unhexlify('00000000')); \
+	def write_vint(val): \
+		res = bytearray(); \
+		while val >= 0x80: res.append((val & 0x7f) | 0x80); val >>= 7; \
+		res.append(val); return res; \
+	f.write(write_vint(h_size)); f.write(write_vint(4)); f.write(write_vint(0)); \
+	f.write(enc_hdr); f.close()"
+	@echo "Created: $@"
+
 # Full test suite
-test: all $(TESTDIR)/test.zip $(TESTDIR)/test.7z $(TESTDIR)/wordlist.txt
+test: all $(TESTDIR)/test.zip $(TESTDIR)/test.7z $(TESTDIR)/test_rar3.rar $(TESTDIR)/test_rar5.rar $(TESTDIR)/wordlist.txt $(TESTDIR)/wordlist_rar.txt
 	@echo ""
 	@echo "============================================"
 	@echo " Running crive test suite"
@@ -627,9 +666,34 @@ test: all $(TESTDIR)/test.zip $(TESTDIR)/test.7z $(TESTDIR)/wordlist.txt
 	fi; \
 	\
 	echo ""; \
-	echo "[TEST 6] Benchmark mode"; \
+	echo "[TEST 6] RAR5 dictionary attack (should find 'password')"; \
+	if $(TARGET) $(TESTDIR)/test_rar5.rar \
+	    --wordlist $(TESTDIR)/wordlist_rar.txt \
+	    --threads 2 \
+	    --no-color \
+	    --no-progress \
+	    --quiet 2>/dev/null; then \
+	    echo "  PASS: RAR5 dictionary attack"; PASS=$$((PASS+1)); \
+	else \
+	    echo "  FAIL: RAR5 dictionary attack"; FAIL=$$((FAIL+1)); \
+	fi; \
+	\
+	echo ""; \
+	echo "[TEST 7] RAR3 detection test"; \
+	if $(TARGET) $(TESTDIR)/test_rar3.rar \
+	    --benchmark \
+	    --threads 1 \
+	    --no-color \
+	    --no-progress 2>/dev/null; then \
+	    echo "  PASS: RAR3 detection"; PASS=$$((PASS+1)); \
+	else \
+	    echo "  FAIL: RAR3 detection"; FAIL=$$((FAIL+1)); \
+	fi; \
+	\
+	echo ""; \
+	echo "[TEST 8] Benchmark mode"; \
 	if $(TARGET) --benchmark \
-	    --benchmark-duration 2 \
+	    --benchmark 2 \
 	    --threads 1 \
 	    --no-color \
 	    --no-progress 2>/dev/null; then \
@@ -649,7 +713,7 @@ test: all $(TESTDIR)/test.zip $(TESTDIR)/test.7z $(TESTDIR)/wordlist.txt
 check: all $(TESTDIR)/wordlist.txt
 	@echo "Running smoke test..."
 	$(TARGET) --benchmark \
-	          --benchmark-duration 1 \
+	          --benchmark 1 \
 	          --threads 1 \
 	          --no-color \
 	          --no-progress
@@ -684,6 +748,8 @@ deps:
 	                                       || echo "  [-] gdb (not found)"
 	@command -v valgrind   >/dev/null 2>&1 && echo "  [OK] valgrind" \
 	                                       || echo "  [-] valgrind (not found)"
+	@command -v unrar      >/dev/null 2>&1 && echo "  [OK] unrar (RAR support)" \
+	                                       || echo "  [-] unrar (not found - RAR support limited)"
 	@command -v strip      >/dev/null 2>&1 && echo "  [OK] strip" \
 	                                       || echo "  [-] strip"
 	@echo ""

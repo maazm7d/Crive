@@ -113,148 +113,8 @@
 #define CHARSET_PRINTABLE    " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
 /* ============================================================
- * ENUMS AND STRUCTS (only those not provided by archive.h or utils.h)
+ * RESULT STRUCTS
  * ============================================================ */
-
-typedef enum {
-    LOG_DEBUG   = 0,
-    LOG_INFO    = 1,
-    LOG_WARNING = 2,
-    LOG_ERROR   = 3,
-    LOG_SILENT  = 4,
-} log_level_t;
-
-typedef enum {
-    ATTACK_NONE         = 0,
-    ATTACK_DICTIONARY   = 1,
-    ATTACK_BRUTEFORCE   = 2,
-    ATTACK_MASK         = 3,
-    ATTACK_HYBRID       = 4,
-    ATTACK_RULE         = 5,
-    ATTACK_BENCHMARK    = 6,
-    ATTACK_MAX
-} attack_mode_t;
-
-typedef enum {
-    ATTACK_RESULT_NOT_FOUND = 0,
-    ATTACK_RESULT_FOUND     = 1,
-    ATTACK_RESULT_EXHAUSTED = 2,
-    ATTACK_RESULT_ERROR     = 3,
-    ATTACK_RESULT_ABORTED   = 4,
-} attack_result_t;
-
-typedef enum {
-    RULE_APPEND_DIGIT   = 0,
-    RULE_PREPEND_DIGIT  = 1,
-    RULE_UPPERCASE_ALL  = 2,
-    RULE_LOWERCASE_ALL  = 3,
-    RULE_CAPITALIZE     = 4,
-    RULE_REVERSE        = 5,
-    RULE_DUPLICATE      = 6,
-    RULE_LEET_SPEAK     = 7,
-    RULE_APPEND_YEAR    = 8,
-    RULE_APPEND_SPECIAL = 9,
-    RULE_TOGGLE_CASE    = 10,
-    RULE_ROTATE_LEFT    = 11,
-    RULE_ROTATE_RIGHT   = 12,
-    RULE_REFLECT        = 13,
-    RULE_STRIP_VOWELS   = 14,
-    RULE_MAX
-} rule_type_t;
-
-typedef struct {
-    rule_type_t type;
-    char        param[64];
-    int         param_int;
-} rule_t;
-
-typedef struct {
-    char    chars[MAX_CHARSET_LEN];
-    int     len;
-    bool    use_lower;
-    bool    use_upper;
-    bool    use_digits;
-    bool    use_special;
-    bool    use_custom;
-    char    custom[MAX_CHARSET_LEN];
-} charset_spec_t;
-
-typedef struct {
-    char    charset[MAX_CHARSET_LEN];
-    int     charset_len;
-} mask_position_t;
-
-typedef struct {
-    mask_position_t positions[MAX_MASK_POSITIONS];
-    int             num_positions;
-    char            raw_mask[MAX_MASK_LEN];
-} mask_spec_t;
-
-typedef struct {
-    bool        append_digits;
-    bool        append_special;
-    bool        prepend_digits;
-    bool        prepend_special;
-    int         suffix_min_len;
-    int         suffix_max_len;
-    int         prefix_min_len;
-    int         prefix_max_len;
-    char        suffix_charset[MAX_CHARSET_LEN];
-    char        prefix_charset[MAX_CHARSET_LEN];
-} hybrid_config_t;
-
-typedef struct {
-    char            archive_path[MAX_PATH_LEN];
-    archive_type_t  archive_type;
-    attack_mode_t   attack_mode;
-    char            wordlist_path[MAX_PATH_LEN];
-    size_t          dict_buffer_size;
-    int             min_length;
-    int             max_length;
-    charset_spec_t  charset;
-    mask_spec_t     mask;
-    hybrid_config_t hybrid;
-    char            rules_path[MAX_PATH_LEN];
-    rule_t          rules[MAX_RULES];
-    int             num_rules;
-    int             num_threads;
-    size_t          batch_size;
-    char            output_path[MAX_PATH_LEN];
-    char            log_path[MAX_PATH_LEN];
-    bool            verbose;
-    bool            quiet;
-    log_level_t     log_level;
-    bool            no_color;
-    bool            show_progress;
-    bool            resume;
-    char            resume_path[MAX_PATH_LEN];
-    bool            save_resume;
-    int             benchmark_duration;
-    uint64_t        limit;
-    uint64_t        skip;
-    int             progress_interval_ms;
-    bool            force_archive_type;
-    bool            interactive;
-    bool            pin_threads;
-    bool            adaptive_batch;
-    bool            show_thread_stats;
-} config_t;
-
-typedef struct {
-    uint32_t        magic;
-    uint32_t        version;
-    attack_mode_t   attack_mode;
-    archive_type_t  archive_type;
-    char            archive_path[MAX_PATH_LEN];
-    char            wordlist_path[MAX_PATH_LEN];
-    uint64_t        total_attempts;
-    uint64_t        wordlist_offset;
-    uint64_t        bruteforce_index;
-    int             current_length;
-    char            brute_counter[MAX_PASSWORD_LEN];
-    time_t          saved_at;
-    uint32_t        checksum;
-} resume_state_t;
 
 typedef struct {
     double      total_speed;
@@ -262,6 +122,7 @@ typedef struct {
     uint64_t    total_hashes;
     double      duration_sec;
     int         num_threads;
+    archive_type_t arch_type;
 } benchmark_result_t;
 
 typedef struct {
@@ -529,9 +390,11 @@ static void print_usage(const char *prog) {
         "%sARCHIVE:%s\n"
         "  %s--zip%s                     Force ZIP mode\n"
         "  %s--7z%s                      Force 7-Zip mode\n"
+        "  %s--rar%s                     Force RAR mode\n"
         "  %s--skip <n>%s                Skip first N candidates\n"
         "  %s--limit <n>%s               Stop after N candidates tested\n\n",
         cc(ANSI_BRIGHT_WHITE), cc(ANSI_RESET),
+        cc(ANSI_CYAN), cc(ANSI_RESET),
         cc(ANSI_CYAN), cc(ANSI_RESET),
         cc(ANSI_CYAN), cc(ANSI_RESET),
         cc(ANSI_CYAN), cc(ANSI_RESET),
@@ -599,6 +462,7 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
         /* Archive */
         {"zip",          no_argument,       NULL, 1013},
         {"7z",           no_argument,       NULL, 1014},
+        {"rar",          no_argument,       NULL, 1018},
         {"skip",         required_argument, NULL, 1015},
         {"limit",        required_argument, NULL, 1016},
 
@@ -769,6 +633,11 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
                 cfg->force_archive_type = true;
                 break;
 
+            case 1018: /* --rar */
+                cfg->archive_type       = ARCHIVE_RAR;
+                cfg->force_archive_type = true;
+                break;
+
             case 1015: /* --skip */
                 cfg->skip = strtoull(optarg, NULL, 10);
                 break;
@@ -803,8 +672,8 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
 
 static int validate_config(config_t *cfg) {
 
-    /* Benchmark needs no archive */
-    if (cfg->attack_mode == ATTACK_BENCHMARK) {
+    /* Benchmark needs no archive (if no path provided) */
+    if (cfg->attack_mode == ATTACK_BENCHMARK && cfg->archive_path[0] == '\0') {
         return 0;
     }
 
@@ -831,11 +700,13 @@ static int validate_config(config_t *cfg) {
         cfg->archive_type = detect_archive_type(cfg->archive_path);
         if (cfg->archive_type == ARCHIVE_UNKNOWN) {
             safe_eprint("%s Cannot determine archive type for: %s\n"
-                        "   Use --zip or --7z to force type.\n",
+                        "   Use --zip, --7z, or --rar to force type.\n",
                         SYM_ERR, cfg->archive_path);
             return -1;
         }
     }
+
+    if (cfg->attack_mode == ATTACK_BENCHMARK) return 0;
 
     /* Attack mode must be set */
     if (cfg->attack_mode == ATTACK_NONE) {
@@ -948,7 +819,7 @@ static void display_config_summary(const config_t *cfg) {
     if (cfg->archive_path[0]) {
         print_kv("Archive",  cfg->archive_path, nc);
 
-        const char *atype_names[] = {"Unknown","ZIP","7-Zip"};
+        const char *atype_names[] = {"Unknown","ZIP","7-Zip","RAR"};
         const char *atype = (cfg->archive_type < ARCHIVE_MAX)
                             ? atype_names[cfg->archive_type] : "Unknown";
         print_kv("Type", atype, nc);
@@ -1208,6 +1079,8 @@ static int preflight_check(const config_t *cfg, archive_ctx_t *archive) {
         /* ZIP check is implicit - if parse succeeded we have enc header */
     } else if (cfg->archive_type == ARCHIVE_7Z) {
         /* 7Z check is implicit */
+    } else if (cfg->archive_type == ARCHIVE_RAR) {
+        /* RAR check is implicit */
     }
 
     return 0;
@@ -1345,23 +1218,25 @@ static void display_benchmark(const benchmark_result_t *res, bool no_color) {
     print_kv_fmt(nc, "Duration",    "%.1f sec", res->duration_sec);
     print_kv_fmt(nc, "Threads",     "%d",       res->num_threads);
 
-    safe_eprint("\n");
-    safe_eprint("  %sEstimated archive cracking speed:%s\n",
-                cc(CLR_LABEL), cc(ANSI_RESET));
+    if (res->arch_type == ARCHIVE_ZIP) {
+        safe_eprint("\n");
+        safe_eprint("  %sEstimated archive cracking speed:%s\n",
+                    cc(CLR_LABEL), cc(ANSI_RESET));
 
-    /* ZIP estimate */
-    double zip_speed = res->total_speed;
-    char zip_str[32];
-    format_speed(zip_str, sizeof(zip_str), zip_speed);
-    safe_eprint("  %s  ZIP  (PKZIP):  %s%s%s\n",
-                cc(ANSI_DIM), cc(CLR_SPEED), zip_str, cc(ANSI_RESET));
+        /* 7Z estimate (much slower due to key derivation) */
+        double sz_speed = res->total_speed / 50000.0; /* rough estimate */
+        char sz_str[32];
+        format_speed(sz_str, sizeof(sz_str), sz_speed);
+        safe_eprint("  %s  7-Zip (AES):  %s%s%s\n",
+                    cc(ANSI_DIM), cc(CLR_SPEED), sz_str, cc(ANSI_RESET));
 
-    /* 7Z estimate (much slower due to key derivation) */
-    double sz_speed = res->total_speed / 50000.0; /* rough estimate */
-    char sz_str[32];
-    format_speed(sz_str, sizeof(sz_str), sz_speed);
-    safe_eprint("  %s  7-Zip (AES):  %s%s%s\n",
-                cc(ANSI_DIM), cc(CLR_SPEED), sz_str, cc(ANSI_RESET));
+        /* RAR estimate */
+        double rar_speed = res->total_speed / 100000.0; /* even slower */
+        char rar_str[32];
+        format_speed(rar_str, sizeof(rar_str), rar_speed);
+        safe_eprint("  %s  RAR  (AES):  %s%s%s\n",
+                    cc(ANSI_DIM), cc(CLR_SPEED), rar_str, cc(ANSI_RESET));
+    }
 
     safe_eprint("\n");
 }
@@ -1431,7 +1306,33 @@ static int run_cracking_session(config_t *cfg) {
         return EXIT_FAILURE;
     }
 
-    /* For benchmark mode, skip archive */
+    /* Open archive if provided */
+    archive_ctx_t *archive = NULL;
+    if (cfg->archive_path[0] != '\0') {
+        safe_eprint("%s Opening archive: %s%s%s\n",
+                    SYM_INFO,
+                    cc(CLR_VALUE), cfg->archive_path, cc(ANSI_RESET));
+
+        /* Allocate archive context from heap */
+        archive = (archive_ctx_t *)calloc(1, ARCHIVE_CTX_SIZE);
+        if (!archive) {
+            safe_eprint("%s Memory allocation failed for archive context.\n",
+                        SYM_ERR);
+            return EXIT_FAILURE;
+        }
+
+        if (archive_open(archive, cfg->archive_path, cfg->archive_type) != 0) {
+            safe_eprint("%s Failed to open/parse archive: %s\n",
+                        SYM_ERR, cfg->archive_path);
+            free(archive);
+            return EXIT_FAILURE;
+        }
+
+        /* Display archive info */
+        display_archive_info(archive, cfg);
+    }
+
+    /* For benchmark mode, skip rest */
     if (cfg->attack_mode == ATTACK_BENCHMARK) {
         display_config_summary(cfg);
 
@@ -1442,27 +1343,34 @@ static int run_cracking_session(config_t *cfg) {
         benchmark_result_t bres = engine_benchmark(cfg, btype,
                                                     cfg->benchmark_duration * 1000);
         display_benchmark(&bres, nc);
+
+        if (archive) {
+            archive_ctx_free(archive);
+            free(archive);
+        }
         return EXIT_SUCCESS;
     }
 
-    /* Open archive */
-    safe_eprint("%s Opening archive: %s%s%s\n",
-                SYM_INFO,
-                cc(CLR_VALUE), cfg->archive_path, cc(ANSI_RESET));
+    /* ----- unrar dependency check ----- */
+    if (cfg->archive_type == ARCHIVE_RAR && !command_exists("unrar")) {
+        /* For RAR5 with check data, we don't strictly need unrar */
+        bool need_unrar = true;
+        if (archive->rar.version == 5 && archive->rar.has_check_value) {
+            need_unrar = false;
+        }
 
-    /* Allocate archive context from heap */
-    archive_ctx_t *archive = (archive_ctx_t *)calloc(1, ARCHIVE_CTX_SIZE);
-    if (!archive) {
-        safe_eprint("%s Memory allocation failed for archive context.\n",
-                    SYM_ERR);
-        return EXIT_FAILURE;
-    }
-
-    if (archive_open(archive, cfg->archive_path, cfg->archive_type) != 0) {
-        safe_eprint("%s Failed to open/parse archive: %s\n",
-                    SYM_ERR, cfg->archive_path);
-        free(archive);
-        return EXIT_FAILURE;
+        if (need_unrar) {
+            safe_eprint("\n%s unrar is required to verify passwords for this RAR archive.\n"
+                        "   Please install unrar:\n"
+                        "     Termux : pkg install unrar\n"
+                        "     Debian : apt install unrar\n"
+                        "     Arch   : pacman -S unrar\n"
+                        "     macOS  : brew install unrar\n\n",
+                        SYM_ERR);
+            archive_ctx_free(archive);
+            free(archive);
+            return EXIT_FAILURE;
+        }
     }
 
     safe_eprint("%s Archive parsed successfully.\n", SYM_OK);
@@ -1513,7 +1421,7 @@ static int run_cracking_session(config_t *cfg) {
     }
 
     /* Set terminal title */
-    char title[128];
+    char title[MAX_PATH_LEN + 128];
     snprintf(title, sizeof(title), "crive - %s",
              cfg->archive_path[0] ? cfg->archive_path : "benchmark");
     term_set_title(title);
@@ -1670,7 +1578,7 @@ static void show_version(void) {
         "crive %s\n"
         "Build:    %s %s\n"
         "Platform: %s\n"
-        "Features: ZIP PKZIP, ZIP WinZip-AES, 7-Zip AES-256\n"
+        "Features: ZIP PKZIP, ZIP WinZip-AES, 7-Zip AES-256, RAR3, RAR5\n"
         "Attacks:  Dictionary, Brute-Force, Mask, Hybrid, Rule-Based\n",
         CRIVE_VERSION_STR,
         CRIVE_BUILD_DATE, CRIVE_BUILD_TIME,
