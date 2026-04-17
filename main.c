@@ -767,7 +767,11 @@ static int parse_args(int argc, char **argv, config_t *cfg) {
  * ============================================================ */
 
 static int validate_config(config_t *cfg) {
-    if (cfg->attack_mode == ATTACK_BENCHMARK && cfg->archive_path[0] == '\0') return 0;
+
+    /* Benchmark needs no archive (if no path provided) */
+    if (cfg->attack_mode == ATTACK_BENCHMARK && cfg->archive_path[0] == '\0') {
+        return 0;
+    }
 
     /* Archive required for all other modes */
     if (cfg->archive_path[0] == '\0') {
@@ -797,6 +801,8 @@ static int validate_config(config_t *cfg) {
             return -1;
         }
     }
+
+    if (cfg->attack_mode == ATTACK_BENCHMARK) return 0;
 
     /* Attack mode must be set */
     if (cfg->attack_mode == ATTACK_NONE) {
@@ -1396,7 +1402,33 @@ static int run_cracking_session(config_t *cfg) {
         return EXIT_FAILURE;
     }
 
-    /* For benchmark mode, skip archive */
+    /* Open archive if provided */
+    archive_ctx_t *archive = NULL;
+    if (cfg->archive_path[0] != '\0') {
+        safe_eprint("%s Opening archive: %s%s%s\n",
+                    SYM_INFO,
+                    cc(CLR_VALUE), cfg->archive_path, cc(ANSI_RESET));
+
+        /* Allocate archive context from heap */
+        archive = (archive_ctx_t *)calloc(1, ARCHIVE_CTX_SIZE);
+        if (!archive) {
+            safe_eprint("%s Memory allocation failed for archive context.\n",
+                        SYM_ERR);
+            return EXIT_FAILURE;
+        }
+
+        if (archive_open(archive, cfg->archive_path, cfg->archive_type) != 0) {
+            safe_eprint("%s Failed to open/parse archive: %s\n",
+                        SYM_ERR, cfg->archive_path);
+            free(archive);
+            return EXIT_FAILURE;
+        }
+
+        /* Display archive info */
+        display_archive_info(archive, cfg);
+    }
+
+    /* For benchmark mode, skip rest */
     if (cfg->attack_mode == ATTACK_BENCHMARK) {
         display_config_summary(cfg);
 
@@ -1407,27 +1439,12 @@ static int run_cracking_session(config_t *cfg) {
         benchmark_result_t bres = engine_benchmark(cfg, btype,
                                                     cfg->benchmark_duration * 1000);
         display_benchmark(&bres, nc);
+
+        if (archive) {
+            archive_ctx_free(archive);
+            free(archive);
+        }
         return EXIT_SUCCESS;
-    }
-
-    /* Open archive */
-    safe_eprint("%s Opening archive: %s%s%s\n",
-                SYM_INFO,
-                cc(CLR_VALUE), cfg->archive_path, cc(ANSI_RESET));
-
-    /* Allocate archive context from heap */
-    archive_ctx_t *archive = (archive_ctx_t *)calloc(1, ARCHIVE_CTX_SIZE);
-    if (!archive) {
-        safe_eprint("%s Memory allocation failed for archive context.\n",
-                    SYM_ERR);
-        return EXIT_FAILURE;
-    }
-
-    if (archive_open(archive, cfg->archive_path, cfg->archive_type) != 0) {
-        safe_eprint("%s Failed to open/parse archive: %s\n",
-                    SYM_ERR, cfg->archive_path);
-        free(archive);
-        return EXIT_FAILURE;
     }
 
     /* ----- unrar dependency check ----- */

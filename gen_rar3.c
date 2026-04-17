@@ -7,6 +7,8 @@ int main() {
     fwrite(mhdr, 1, 7, f);
     uint8_t salt[8] = {1,2,3,4,5,6,7,8};
     fwrite(salt, 1, 8, f);
+    uint8_t enc[16] = {0};
+    fwrite(enc, 1, 16, f);
     fclose(f);
     return 0;
 }

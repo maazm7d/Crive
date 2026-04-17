@@ -1180,7 +1180,7 @@ benchmark_result_t engine_benchmark(const config_t *cfg,
     res.num_threads = cfg->num_threads;
 
     log_info("Benchmark: type=%s threads=%d duration=%dms",
-             (arch_type == ARCHIVE_ZIP) ? "ZIP" : "7Z",
+             (arch_type == ARCHIVE_ZIP) ? "ZIP" : (arch_type == ARCHIVE_7Z ? "7Z" : "RAR"),
              cfg->num_threads, duration_ms);
 
     engine_state_t eng;

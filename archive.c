@@ -2336,32 +2336,56 @@ static bool sz_validate_password(const struct sz_ctx *ctx,
     uint8_t iv[AES_BLOCK_SIZE];
     memcpy(iv, ctx->aes_iv, AES_BLOCK_SIZE);
 
+    if (ctx->is_header_encrypted) {
+        /* HE=ON: The NextHeader is encrypted. We can definitively verify it by
+           decrypting and checking its CRC32 against ctx->next_header_crc. */
+        size_t h_size = (size_t)ctx->next_header_size;
+        if (h_size == 0 || h_size > ctx->data_size) {
+            volatile uint8_t *vk = (volatile uint8_t *)aes_key;
+            for (int i = 0; i < 32; i++) vk[i] = 0;
+            return false;
+        }
+
+        /* 7z KDF (PBKDF2-SHA256 with 2^19 iterations) is the bottleneck.
+           Decrypting the header and checking CRC32 is negligible in comparison. */
+        uint8_t *dec = (uint8_t *)malloc(h_size);
+        if (!dec) {
+            volatile uint8_t *vk = (volatile uint8_t *)aes_key;
+            for (int i = 0; i < 32; i++) vk[i] = 0;
+            return sz_validate_password_cli(archive_path, password);
+        }
+
+        size_t hdr_start = sizeof(sz_signature_header_t) + (size_t)ctx->next_header_offset;
+        aes_cbc_decrypt(&aes, ctx->aes_iv, ctx->data + hdr_start, dec, h_size);
+
+        uint32_t computed = crc32_full(dec, h_size);
+        free(dec);
+
+        volatile uint8_t *vk = (volatile uint8_t *)aes_key;
+        for (int i = 0; i < 32; i++) vk[i] = 0;
+
+        return (computed == ctx->next_header_crc);
+    }
+
+    /* HE=OFF: Use heuristic on the first block of the encrypted stream. */
     uint8_t dec_block[AES_BLOCK_SIZE];
-    aes_cbc_decrypt(&aes, iv,
+    aes_cbc_decrypt(&aes, ctx->aes_iv,
                      ctx->enc_header_data,
                      dec_block,
                      AES_BLOCK_SIZE);
 
     uint8_t first = dec_block[0];
-    bool maybe_ok = false;
-    if (ctx->is_header_encrypted) {
-        /* If the header is encrypted, we currently fallback to the CLI.
-           Heuristics on compressed streams are unreliable. */
-        maybe_ok = true;
-    } else {
-        maybe_ok = (first == SZ_ID_HEADER          ||
+    bool maybe_ok = (first == SZ_ID_HEADER          ||
                     first == SZ_ID_ENCODED_HEADER   ||
                     first == SZ_ID_END              ||
                     first == SZ_ID_PACK_INFO        ||
                     first == SZ_ID_UNPACK_INFO      ||
                     first == SZ_ID_MAIN_STREAMS_INFO);
-    }
 
     volatile uint8_t *vk = (volatile uint8_t *)aes_key;
     for (int i = 0; i < 32; i++) vk[i] = 0;
 
     if (maybe_ok) {
-        /* Double-confirm with CLI if internal check says OK or if no header encryption */
         return sz_validate_password_cli(archive_path, password);
     }
 
@@ -2484,6 +2508,8 @@ void archive_print_info(const archive_ctx_t *ctx, bool no_color) {
             fprintf(stderr,"  %sEncrypted:%s%sYes%s\n",        c_l,c_r,c_v,c_r);
             if (r->version == 5) {
                 fprintf(stderr,"  %sKDF Iters:%s%s%u%s\n",    c_l,c_r,c_v,r->iterations,c_r);
+            } else {
+                fprintf(stderr,"  %sKDF Iters:%s%s524288%s\n", c_l,c_r,c_v,c_r);
             }
             fprintf(stderr,"  %sSalt Len:%s %s%d%s\n",        c_l,c_r,c_v,r->salt_len,c_r);
             break;
