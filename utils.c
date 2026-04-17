@@ -228,58 +228,8 @@ static const char *archive_type_names[] = {
 };
 
 /* ============================================================
- * CHARSET SPEC STRUCT
+ * RULE TYPE NAMES
  * ============================================================ */
-
-typedef struct {
-    char    chars[MAX_CHARSET_LEN];
-    int     len;
-    bool    use_lower;
-    bool    use_upper;
-    bool    use_digits;
-    bool    use_special;
-    bool    use_custom;
-    char    custom[MAX_CHARSET_LEN];
-} charset_spec_t;
-
-/* ============================================================
- * MASK POSITION STRUCT
- * ============================================================ */
-
-#define MAX_MASK_POSITIONS      32
-
-typedef struct {
-    char    charset[MAX_CHARSET_LEN];
-    int     charset_len;
-} mask_position_t;
-
-typedef struct {
-    mask_position_t positions[MAX_MASK_POSITIONS];
-    int             num_positions;
-    char            raw_mask[MAX_MASK_LEN];
-} mask_spec_t;
-
-/* ============================================================
- * HYBRID CONFIG STRUCT
- * ============================================================ */
-
-typedef struct {
-    bool        append_digits;
-    bool        append_special;
-    bool        prepend_digits;
-    bool        prepend_special;
-    int         suffix_min_len;
-    int         suffix_max_len;
-    int         prefix_min_len;
-    int         prefix_max_len;
-    char        suffix_charset[MAX_CHARSET_LEN];
-    char        prefix_charset[MAX_CHARSET_LEN];
-} hybrid_config_t;
-
-/* ============================================================
- * RULE STRUCT
- * ============================================================ */
-
 
 static const char *rule_type_names[] __attribute__((unused)) = {
     [RULE_APPEND_DIGIT]     = "append_digit",
@@ -298,12 +248,6 @@ static const char *rule_type_names[] __attribute__((unused)) = {
     [RULE_REFLECT]          = "reflect",
     [RULE_STRIP_VOWELS]     = "strip_vowels",
 };
-
-typedef struct {
-    rule_type_t type;
-    char        param[64];
-    int         param_int;
-} rule_t;
 
 /* ============================================================
  * THREAD STATUS STRUCT
@@ -331,92 +275,6 @@ typedef struct {
     uint64_t    last_attempts;
     uint64_t    last_time_ns;
 } speed_tracker_t;
-
-/* ============================================================
- * RESUME STATE STRUCT
- * ============================================================ */
-
-typedef struct {
-    uint32_t    magic;
-    uint32_t    version;
-    attack_mode_t attack_mode;
-    archive_type_t archive_type;
-    char        archive_path[MAX_PATH_LEN];
-    char        wordlist_path[MAX_PATH_LEN];
-    uint64_t    total_attempts;
-    uint64_t    wordlist_offset;
-    uint64_t    bruteforce_index;
-    int         current_length;
-    char        brute_counter[MAX_PASSWORD_LEN];
-    time_t      saved_at;
-    uint32_t    checksum;
-} resume_state_t;
-
-/* ============================================================
- * MAIN CONFIG STRUCT
- * ============================================================ */
-
-typedef struct {
-    /* Target */
-    char            archive_path[MAX_PATH_LEN];
-    archive_type_t  archive_type;
-
-    /* Attack mode */
-    attack_mode_t   attack_mode;
-
-    /* Dictionary options */
-    char            wordlist_path[MAX_PATH_LEN];
-    size_t          dict_buffer_size;
-
-    /* Brute-force options */
-    int             min_length;
-    int             max_length;
-    charset_spec_t  charset;
-
-    /* Mask options */
-    mask_spec_t     mask;
-
-    /* Hybrid options */
-    hybrid_config_t hybrid;
-
-    /* Rule options */
-    char            rules_path[MAX_PATH_LEN];
-    rule_t          rules[MAX_RULES];
-    int             num_rules;
-
-    /* Threading */
-    int             num_threads;
-    size_t          batch_size;
-
-    /* Output */
-    char            output_path[MAX_PATH_LEN];
-    char            log_path[MAX_PATH_LEN];
-    bool            verbose;
-    bool            quiet;
-    log_level_t     log_level;
-    bool            no_color;
-    bool            show_progress;
-
-    /* Resume */
-    bool            resume;
-    char            resume_path[MAX_PATH_LEN];
-    bool            save_resume;
-
-    /* Benchmark */
-    int             benchmark_duration;
-
-    /* Limits */
-    uint64_t        limit;
-    uint64_t        skip;
-
-    /* Performance */
-    int             progress_interval_ms;
-
-    /* Internal state flags */
-    bool            force_archive_type;
-    bool            interactive;
-
-} config_t;
 
 /* ============================================================
  * SHARED ENGINE STATE STRUCT

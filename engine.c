@@ -56,91 +56,6 @@ void log_message(log_level_t level, const char *fmt, ...);
 #define MB                   (1024ULL * KB)
 
 /* ============================================================
- * STRUCT FORWARD DECLARATIONS
- * ============================================================ */
-
-
-typedef struct {
-    char    chars[MAX_CHARSET_LEN];
-    int     len;
-    bool    use_lower;
-    bool    use_upper;
-    bool    use_digits;
-    bool    use_special;
-    bool    use_custom;
-    char    custom[MAX_CHARSET_LEN];
-} charset_spec_t;
-
-typedef struct {
-    char    charset[MAX_CHARSET_LEN];
-    int     charset_len;
-} mask_position_t;
-
-typedef struct {
-    mask_position_t positions[MAX_MASK_POSITIONS];
-    int             num_positions;
-    char            raw_mask[MAX_MASK_LEN];
-} mask_spec_t;
-
-typedef struct {
-    bool        append_digits;
-    bool        append_special;
-    bool        prepend_digits;
-    bool        prepend_special;
-    int         suffix_min_len;
-    int         suffix_max_len;
-    int         prefix_min_len;
-    int         prefix_max_len;
-    char        suffix_charset[MAX_CHARSET_LEN];
-    char        prefix_charset[MAX_CHARSET_LEN];
-} hybrid_config_t;
-
-
-typedef struct {
-    rule_type_t type;
-    char        param[64];
-    int         param_int;
-} rule_t;
-
-/* ============================================================
- * CONFIG STRUCT
- * ============================================================ */
-
-typedef struct {
-    char            archive_path[MAX_PATH_LEN];
-    archive_type_t  archive_type;
-    attack_mode_t   attack_mode;
-    char            wordlist_path[MAX_PATH_LEN];
-    size_t          dict_buffer_size;
-    int             min_length;
-    int             max_length;
-    charset_spec_t  charset;
-    mask_spec_t     mask;
-    hybrid_config_t hybrid;
-    char            rules_path[MAX_PATH_LEN];
-    rule_t          rules[MAX_RULES];
-    int             num_rules;
-    int             num_threads;
-    size_t          batch_size;
-    char            output_path[MAX_PATH_LEN];
-    char            log_path[MAX_PATH_LEN];
-    bool            verbose;
-    bool            quiet;
-    log_level_t     log_level;
-    bool            no_color;
-    bool            show_progress;
-    bool            resume;
-    char            resume_path[MAX_PATH_LEN];
-    bool            save_resume;
-    int             benchmark_duration;
-    uint64_t        limit;
-    uint64_t        skip;
-    int             progress_interval_ms;
-    bool            force_archive_type;
-    bool            interactive;
-} config_t;
-
-/* ============================================================
  * FORWARD DECLARATIONS FROM attacks.c
  * ============================================================ */
 
@@ -226,23 +141,6 @@ extern void   speed_tracker_update     (speed_tracker_t *st,
                                          uint64_t total_attempts);
 extern double speed_tracker_moving_avg (const speed_tracker_t *st);
 extern uint64_t speed_tracker_current  (const speed_tracker_t *st);
-
-/* Resume */
-typedef struct {
-    uint32_t        magic;
-    uint32_t        version;
-    attack_mode_t   attack_mode;
-    archive_type_t  archive_type;
-    char            archive_path[MAX_PATH_LEN];
-    char            wordlist_path[MAX_PATH_LEN];
-    uint64_t        total_attempts;
-    uint64_t        wordlist_offset;
-    uint64_t        bruteforce_index;
-    int             current_length;
-    char            brute_counter[MAX_PASSWORD_LEN];
-    time_t          saved_at;
-    uint32_t        checksum;
-} resume_state_t;
 
 extern int resume_save(const char *path, const resume_state_t *rs);
 extern int resume_load(const char *path, resume_state_t *rs);
